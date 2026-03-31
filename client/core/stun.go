@@ -559,11 +559,10 @@ func (c *Client) udpReadLoop() {
 			continue
 		}
 
-		// Encrypted tunnel data: [0x00][8-byte tunnel_id][encrypted payload]
+		// Tunnel data over UDP: [0x00][8-byte tunnel_id][plaintext payload]
 		if n > 9 && data[0] == 0x00 {
 			tunnelID := tunnelIDFromBytes(data[1:9])
-			encrypted := data[9:]
-			c.handleEncryptedUDPData(tunnelID, encrypted, addr)
+			c.handleUDPTunnelData(tunnelID, data[9:])
 			continue
 		}
 

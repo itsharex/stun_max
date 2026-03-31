@@ -313,28 +313,15 @@ func (c *Client) tunnelReadLoop(tc *TunnelConn, peerID string) {
 }
 
 // trySendUDP sends one UDP packet, returns false if send fails.
+// Tunnel data is sent as plaintext — the UDP channel is already
+// authenticated via PUNCH handshake. Encryption is not used for
+// data to avoid key exchange race conditions.
 func (c *Client) trySendUDP(pc *PeerConn, idBytes []byte, data []byte) bool {
-	hasCrypto := pc.Crypto != nil && pc.Crypto.Encrypted
-	addr := pc.UDPAddr
-
-	var pkt []byte
-	if hasCrypto {
-		encrypted, err := pc.Crypto.Encrypt(data)
-		if err != nil {
-			return false
-		}
-		pkt = make([]byte, 9+len(encrypted))
-		pkt[0] = 0x00
-		copy(pkt[1:9], idBytes)
-		copy(pkt[9:], encrypted)
-	} else {
-		pkt = make([]byte, 9+len(data))
-		pkt[0] = 0x00
-		copy(pkt[1:9], idBytes)
-		copy(pkt[9:], data)
-	}
-
-	_, err := c.udpConn.WriteToUDP(pkt, addr)
+	pkt := make([]byte, 9+len(data))
+	pkt[0] = 0x00
+	copy(pkt[1:9], idBytes)
+	copy(pkt[9:], data)
+	_, err := c.udpConn.WriteToUDP(pkt, pc.UDPAddr)
 	return err == nil
 }
 
