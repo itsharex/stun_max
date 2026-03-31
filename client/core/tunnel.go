@@ -13,9 +13,11 @@ import (
 
 // Buffer pools
 var (
+	// P2P buffer: 8KB — will be fragmented into 1200-byte UDP packets by trySendUDP.
+	// Larger buffer = fewer TCP reads = fewer UDP bursts = less packet loss.
 	p2pBufPool = sync.Pool{
 		New: func() interface{} {
-			b := make([]byte, 1200)
+			b := make([]byte, 8*1024)
 			return &b
 		},
 	}
@@ -243,8 +245,6 @@ func (c *Client) tunnelReadLoop(tc *TunnelConn, peerID string) {
 		c.sendTunnelClose(peerID, tc.TunnelID)
 	}()
 
-	idBytes := tunnelIDToBytes(tc.TunnelID)
-
 	for {
 		select {
 		case <-tc.Done:
@@ -289,8 +289,8 @@ func (c *Client) tunnelReadLoop(tc *TunnelConn, peerID string) {
 			}
 
 			if useP2P {
-				// Try UDP, fallback to relay on failure
-				if !c.trySendUDP(pc, idBytes, buf[:n]) {
+				// Fragment into 1200-byte UDP packets, fallback to relay on failure
+				if !c.sendUDPDirect(pc, tc.TunnelID, buf[:n]) {
 					encoded := base64.StdEncoding.EncodeToString(buf[:n])
 					c.sendRelay(peerID, "tunnel_data", TunnelData{TunnelID: tc.TunnelID, Data: encoded})
 				}
@@ -389,11 +389,10 @@ func (c *Client) handleTunnelData(msg Message) {
 	if tc.Forward != nil {
 		atomic.AddInt64(&tc.Forward.BytesDown, int64(len(data)))
 	}
-	// Generous write deadline — don't kill tunnel on temporary slowness
+	// Don't close tunnel on write error — temporary backpressure is normal.
+	// TCP keepalive will detect truly dead connections.
 	tc.Conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	if _, err := tc.Conn.Write(data); err != nil {
-		c.closeTunnel(td.TunnelID)
-	}
+	tc.Conn.Write(data)
 }
 
 func (c *Client) handleCloseTunnel(msg Message) {

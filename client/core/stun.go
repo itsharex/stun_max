@@ -258,8 +258,6 @@ func (c *Client) handleStunInfo(msg Message) {
 		return
 	}
 
-	// Detect LAN peer: same public IP = same network
-	// If so, use the local/private address for direct connection (much faster)
 	targetAddr := info.Addr
 	isLAN := false
 	if info.Local != "" && c.publicAddr != "" {
@@ -286,6 +284,14 @@ func (c *Client) handleStunInfo(msg Message) {
 		}
 		c.peerConns[msg.From] = pc
 	}
+
+	// CRITICAL: don't overwrite UDPAddr if peer is already direct and working.
+	// Changing addr mid-stream breaks crypto lookup and causes tunnel flaps.
+	if pc.Mode == "direct" {
+		c.peerConnsMu.Unlock()
+		return // already connected, ignore new stun_info
+	}
+
 	pc.UDPAddr = udpAddr
 	c.peerConnsMu.Unlock()
 
@@ -576,16 +582,30 @@ func (c *Client) handleUDPTunnelData(tunnelID string, data []byte) {
 
 // handleEncryptedUDPData decrypts and processes tunnel data from a P2P peer.
 func (c *Client) handleEncryptedUDPData(tunnelID string, encrypted []byte, addr *net.UDPAddr) {
-	// Find which peer sent this based on addr
+	// Look up crypto by tunnel's peer ID (more reliable than addr matching)
 	var crypto *PeerCrypto
-	c.peerConnsMu.RLock()
-	for _, pc := range c.peerConns {
-		if pc.UDPAddr != nil && pc.UDPAddr.IP.Equal(addr.IP) && pc.UDPAddr.Port == addr.Port {
+	c.tunnelsMu.RLock()
+	tc, ok := c.tunnels[tunnelID]
+	c.tunnelsMu.RUnlock()
+	if ok && tc.PeerID != "" {
+		c.peerConnsMu.RLock()
+		if pc, exists := c.peerConns[tc.PeerID]; exists {
 			crypto = pc.Crypto
-			break
 		}
+		c.peerConnsMu.RUnlock()
 	}
-	c.peerConnsMu.RUnlock()
+
+	// Fallback: look up by addr
+	if crypto == nil {
+		c.peerConnsMu.RLock()
+		for _, pc := range c.peerConns {
+			if pc.UDPAddr != nil && pc.UDPAddr.IP.Equal(addr.IP) && pc.UDPAddr.Port == addr.Port {
+				crypto = pc.Crypto
+				break
+			}
+		}
+		c.peerConnsMu.RUnlock()
+	}
 
 	if crypto != nil && crypto.Encrypted {
 		plaintext, err := crypto.Decrypt(encrypted)
@@ -593,10 +613,11 @@ func (c *Client) handleEncryptedUDPData(tunnelID string, encrypted []byte, addr 
 			c.handleUDPTunnelData(tunnelID, plaintext)
 			return
 		}
-		// Decryption failed — try as plaintext (peer may not have encryption yet)
+		// Decryption failed — DON'T write garbage, just drop the packet
+		return
 	}
 
-	// No encryption or decryption failed — treat as raw data
+	// No encryption — treat as raw data
 	c.handleUDPTunnelData(tunnelID, encrypted)
 }
 
