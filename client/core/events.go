@@ -6,6 +6,8 @@ type EventType int
 const (
 	EventConnected EventType = iota
 	EventDisconnected
+	EventReconnecting
+	EventReconnected
 	EventJoinedRoom
 	EventPeerListUpdated
 	EventPeerJoined

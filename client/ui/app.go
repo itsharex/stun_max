@@ -166,6 +166,20 @@ func (a *App) handleEvent(evt core.Event) {
 		if p, ok := evt.Data.(core.SpeedTestProgressEvent); ok {
 			a.Dashboard.SpeedTest.handleProgress(p)
 		}
+	case core.EventDisconnected:
+		if le, ok := evt.Data.(core.LogEvent); ok {
+			a.addLog("warn", le.Message)
+		}
+	case core.EventReconnecting:
+		if le, ok := evt.Data.(core.LogEvent); ok {
+			a.addLog("info", le.Message)
+			a.Error = le.Message
+		}
+	case core.EventReconnected:
+		if le, ok := evt.Data.(core.LogEvent); ok {
+			a.addLog("info", le.Message)
+			a.Error = ""
+		}
 	case core.EventLog:
 		if le, ok := evt.Data.(core.LogEvent); ok {
 			a.addLog(le.Level, le.Message)

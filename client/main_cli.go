@@ -118,6 +118,18 @@ func main() {
 func consumeEvents() {
 	for evt := range client.Events() {
 		switch evt.Type {
+		case core.EventDisconnected:
+			if le, ok := evt.Data.(core.LogEvent); ok {
+				notify(cYellow, "%s", le.Message)
+			}
+		case core.EventReconnecting:
+			if le, ok := evt.Data.(core.LogEvent); ok {
+				notify(cCyan, "%s", le.Message)
+			}
+		case core.EventReconnected:
+			if le, ok := evt.Data.(core.LogEvent); ok {
+				notify(cGreen, "%s", le.Message)
+			}
 		case core.EventPeerJoined:
 			if pe, ok := evt.Data.(core.PeerEvent); ok {
 				notify(cGreen, "Peer joined: %s (%s)", pe.Name, shortID(pe.ID))

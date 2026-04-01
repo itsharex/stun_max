@@ -413,8 +413,16 @@ func (c *Client) readLoop() {
 				return
 			default:
 			}
-			c.emit(EventError, LogEvent{Level: "error", Message: fmt.Sprintf("Connection lost: %v", err)})
-			c.emit(EventDisconnected, nil)
+
+			c.emit(EventDisconnected, LogEvent{Level: "warn", Message: "Connection lost, reconnecting..."})
+
+			// Auto-reconnect loop
+			if c.reconnect() {
+				continue // reconnected, resume reading
+			}
+
+			// Reconnect failed permanently
+			c.emit(EventError, LogEvent{Level: "error", Message: "Reconnect failed, disconnected"})
 			close(c.done)
 			return
 		}
@@ -429,6 +437,86 @@ func (c *Client) readLoop() {
 			c.handleMessage(msg)
 		}
 	}
+}
+
+// reconnect attempts to re-establish the WebSocket connection and rejoin the room.
+// Tries with exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (max), up to 5 minutes total.
+func (c *Client) reconnect() bool {
+	backoff := 1 * time.Second
+	maxBackoff := 30 * time.Second
+	deadline := time.Now().Add(5 * time.Minute)
+
+	for attempt := 1; time.Now().Before(deadline); attempt++ {
+		select {
+		case <-c.done:
+			return false
+		default:
+		}
+
+		c.emit(EventReconnecting, LogEvent{Level: "info", Message: fmt.Sprintf("Reconnect attempt %d (next in %s)...", attempt, backoff)})
+
+		time.Sleep(backoff)
+
+		// Try to connect
+		dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+		conn, _, err := dialer.Dial(c.Config.ServerURL, nil)
+		if err != nil {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		// Read welcome
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_, welcomeData, err := conn.ReadMessage()
+		if err != nil {
+			conn.Close()
+			continue
+		}
+		conn.SetReadDeadline(time.Time{})
+
+		var welcome Message
+		if err := json.Unmarshal(welcomeData, &welcome); err != nil || welcome.Type != "welcome" {
+			conn.Close()
+			continue
+		}
+		var payload struct{ ID string `json:"id"` }
+		json.Unmarshal(welcome.Payload, &payload)
+
+		// Update connection
+		c.connMu.Lock()
+		oldConn := c.conn
+		c.conn = conn
+		c.MyID = payload.ID
+		c.connMu.Unlock()
+		if oldConn != nil {
+			oldConn.Close()
+		}
+
+		// Rejoin room
+		joinPayload, _ := json.Marshal(map[string]string{
+			"room":          c.room,
+			"password_hash": c.passwordHash,
+			"name":          c.name,
+		})
+		c.sendMsg(Message{
+			Type:    "join",
+			Room:    c.room,
+			Payload: json.RawMessage(joinPayload),
+		})
+
+		// Re-announce STUN info
+		if c.publicAddr != "" {
+			c.sendStunInfo("")
+		}
+
+		c.emit(EventReconnected, LogEvent{Level: "info", Message: fmt.Sprintf("Reconnected (ID: %s)", c.MyID)})
+		return true
+	}
+
+	return false
 }
 
 func splitMessages(data []byte) [][]byte {
