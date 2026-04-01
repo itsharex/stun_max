@@ -54,11 +54,33 @@ type App struct {
 
 // NewApp creates a new App with default state.
 func NewApp() *App {
-	return &App{
+	a := &App{
 		Window: new(app.Window),
 		Theme:  NewTheme(),
 		Screen: ScreenConnect,
 	}
+	// Try auto-connect if config exists and auto_connect is enabled
+	if cfg := LoadConfig(); cfg != nil && cfg.AutoConnect && cfg.ServerURL != "" && cfg.Room != "" {
+		a.Connect.inited = true // skip init, we'll fill from config
+		go func() {
+			// Small delay to let window initialize
+			time.Sleep(300 * time.Millisecond)
+			a.mu.Lock()
+			a.Connect.Connecting = true
+			a.mu.Unlock()
+			a.Window.Invalidate()
+
+			a.DoConnect(core.ClientConfig{
+				ServerURL:   cfg.ServerURL,
+				Room:        cfg.Room,
+				Password:    cfg.Password,
+				Name:        cfg.Name,
+				STUNServers: cfg.STUNServers,
+				NoSTUN:      cfg.NoSTUN,
+			})
+		}()
+	}
+	return a
 }
 
 // Run is the main event loop.
@@ -96,35 +118,6 @@ func (a *App) layout(gtx layout.Context) layout.Dimensions {
 		return a.Dashboard.Layout(gtx, a.Theme, a)
 	}
 	return layout.Dimensions{Size: gtx.Constraints.Max}
-}
-
-// StartEventConsumer reads events from the core client and updates UI state.
-func (a *App) StartEventConsumer() {
-	go func() {
-		for evt := range a.Client.Events() {
-			a.handleEvent(evt)
-			a.Window.Invalidate()
-		}
-	}()
-	// Periodic refresh for forward traffic stats (1s interval)
-	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				if a.Client == nil {
-					return
-				}
-				a.mu.Lock()
-				a.Forwards = a.Client.Forwards()
-				a.mu.Unlock()
-				a.Window.Invalidate()
-			case <-a.Client.Done():
-				return
-			}
-		}
-	}()
 }
 
 func (a *App) handleEvent(evt core.Event) {
@@ -209,9 +202,40 @@ func (a *App) DoConnect(cfg core.ClientConfig) {
 			a.Window.Invalidate()
 			return
 		}
+
+		// Start event consumer BEFORE joining so we can catch error/peer_list
+		a.mu.Lock()
+		a.Client = client
+		a.mu.Unlock()
+
+		// Channel to wait for join result
+		joinResult := make(chan bool, 1)
+		go func() {
+			for evt := range client.Events() {
+				a.handleEvent(evt)
+				a.Window.Invalidate()
+
+				switch evt.Type {
+				case core.EventPeerListUpdated:
+					// Got peer list = join succeeded
+					select {
+					case joinResult <- true:
+					default:
+					}
+				case core.EventError:
+					// Server rejected join
+					select {
+					case joinResult <- false:
+					default:
+					}
+				}
+			}
+		}()
+
 		if err := client.JoinRoom(); err != nil {
 			client.Disconnect()
 			a.mu.Lock()
+			a.Client = nil
 			a.Error = "Join failed: " + err.Error()
 			a.Connect.Connecting = false
 			a.mu.Unlock()
@@ -219,8 +243,27 @@ func (a *App) DoConnect(cfg core.ClientConfig) {
 			return
 		}
 
+		// Wait up to 5 seconds for join confirmation
+		var joinOK bool
+		select {
+		case joinOK = <-joinResult:
+		case <-time.After(5 * time.Second):
+			joinOK = true // timeout = assume success (no error received)
+		}
+
+		if !joinOK {
+			client.Disconnect()
+			a.mu.Lock()
+			a.Client = nil
+			a.Connect.Connecting = false
+			// a.Error already set by handleEvent
+			a.mu.Unlock()
+			a.Window.Invalidate()
+			return
+		}
+
+		// Join succeeded — switch to dashboard
 		a.mu.Lock()
-		a.Client = client
 		a.Screen = ScreenDashboard
 		a.RoomName = cfg.Room
 		a.Error = ""
@@ -229,14 +272,14 @@ func (a *App) DoConnect(cfg core.ClientConfig) {
 
 		// Save config
 		saved := &SavedConfig{
-			ServerURL: cfg.ServerURL,
-			Room:      cfg.Room,
-			Password:  cfg.Password,
-			Name:      cfg.Name,
+			ServerURL:   cfg.ServerURL,
+			Room:        cfg.Room,
+			Password:    cfg.Password,
+			Name:        cfg.Name,
 			STUNServers: cfg.STUNServers,
-			NoSTUN:    cfg.NoSTUN,
+			NoSTUN:      cfg.NoSTUN,
+			AutoConnect: true, // successfully connected = enable auto-connect
 		}
-		// Preserve saved forwards
 		if prev := LoadConfig(); prev != nil {
 			saved.Forwards = prev.Forwards
 			saved.Autostart = prev.Autostart
@@ -250,7 +293,25 @@ func (a *App) DoConnect(cfg core.ClientConfig) {
 		}
 		a.mu.Unlock()
 
-		a.StartEventConsumer()
+		// Periodic refresh for forward traffic stats
+		go func() {
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					if a.Client == nil {
+						return
+					}
+					a.mu.Lock()
+					a.Forwards = a.Client.Forwards()
+					a.mu.Unlock()
+					a.Window.Invalidate()
+				case <-a.Client.Done():
+					return
+				}
+			}
+		}()
 
 		if !cfg.NoSTUN {
 			servers := cfg.STUNServers
@@ -260,7 +321,7 @@ func (a *App) DoConnect(cfg core.ClientConfig) {
 			client.DiscoverSTUN(servers)
 		}
 
-		// Auto-start saved enabled forwards (after a short delay for peer discovery)
+		// Auto-start saved enabled forwards
 		go func() {
 			time.Sleep(3 * time.Second)
 			a.mu.Lock()

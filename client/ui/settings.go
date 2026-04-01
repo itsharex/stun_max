@@ -26,6 +26,7 @@ type SettingsPanel struct {
 	AllowForward widget.Bool
 	LocalOnly    widget.Bool
 	Autostart    widget.Bool
+	AutoConnect  widget.Bool
 
 	// STUN server state
 	STUNToggles      map[string]*widget.Bool // public server toggles
@@ -44,6 +45,9 @@ func (s *SettingsPanel) init(a *App) {
 	s.AllowForward.Value = true
 	s.LocalOnly.Value = true
 	s.Autostart.Value = GetAutostart()
+	if cfg := LoadConfig(); cfg != nil {
+		s.AutoConnect.Value = cfg.AutoConnect
+	}
 
 	s.CustomSTUNEditor.SingleLine = true
 	s.STUNToggles = make(map[string]*widget.Bool)
@@ -114,6 +118,12 @@ func (s *SettingsPanel) Layout(gtx layout.Context, th *material.Theme, a *App) l
 			SaveConfig(cfg)
 		}
 	}
+	if s.AutoConnect.Update(gtx) {
+		if cfg := LoadConfig(); cfg != nil {
+			cfg.AutoConnect = s.AutoConnect.Value
+			SaveConfig(cfg)
+		}
+	}
 
 	// Handle STUN toggle changes
 	for _, b := range s.STUNToggles {
@@ -163,8 +173,17 @@ func (s *SettingsPanel) Layout(gtx layout.Context, th *material.Theme, a *App) l
 			return layout.Inset{Top: unit.Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 				return s.layoutSettingCard(gtx, th,
 					"Start on Boot (Windows)",
-					"Automatically launch STUN Max when Windows starts.",
+					"Launch STUN Max as administrator when Windows starts. Uses Task Scheduler with highest privileges.",
 					&s.Autostart,
+				)
+			})
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{Top: unit.Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return s.layoutSettingCard(gtx, th,
+					"Auto Connect",
+					"Automatically connect to the last room on launch. If connection fails, stays on the login screen.",
+					&s.AutoConnect,
 				)
 			})
 		}),

@@ -2,8 +2,8 @@
 
 package ui
 
-// SetAutostart is a no-op on non-Windows platforms.
-func SetAutostart(enable bool) error { return nil }
-
-// GetAutostart always returns false on non-Windows platforms.
-func GetAutostart() bool { return false }
+func SetAutostart(enable bool) error                  { return nil }
+func GetAutostart() bool                              { return false }
+func SetAutoLogin(username, password string) error     { return nil }
+func GetAutoLogin() (enabled bool, username string)    { return false, "" }
+func AutoLoginSupported() bool                         { return false }

@@ -1,5 +1,8 @@
 # STUN Max
 
+![img.png](img/img_3.png)
+
+
 P2P TCP tunnel with STUN hole punching and automatic server relay fallback. Cross-platform GUI + CLI.
 
 ## Architecture
