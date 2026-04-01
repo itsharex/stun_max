@@ -144,17 +144,11 @@ func (h *Hub) removeClientFromRoom(client *Client) {
 
 	room.mu.Lock()
 	delete(room.Clients, client.id)
-	empty := len(room.Clients) == 0
 	room.mu.Unlock()
 
-	if empty {
-		h.mu.Lock()
-		delete(h.rooms, client.roomKey)
-		h.mu.Unlock()
-		log.Printf("Room removed (empty): %s", client.roomKey)
-	} else {
-		room.broadcastPeerList()
-	}
+	// Don't delete room when empty — rooms are created via dashboard
+	// and should persist until explicitly deleted by admin.
+	room.broadcastPeerList()
 
 	client.room = ""
 	client.roomKey = ""
