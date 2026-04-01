@@ -47,13 +47,14 @@ type PeerInfo struct {
 
 // PeerConn tracks per-peer connection state for hole punching.
 type PeerConn struct {
-	PeerID    string
-	Mode      string       // "connecting", "direct", "relay"
-	UDPAddr   *net.UDPAddr // peer's public UDP address
-	UDPConn   *net.UDPConn // shared UDP socket
-	DirectTCP net.Conn     // direct TCP connection (after hole punch upgrade)
-	LastPunch time.Time
-	Crypto    *PeerCrypto  // encryption state
+	PeerID     string
+	Mode       string       // "connecting", "direct", "relay"
+	UDPAddr    *net.UDPAddr // peer's public UDP address
+	UDPConn    *net.UDPConn // shared UDP socket
+	DirectTCP  net.Conn     // direct TCP connection (after hole punch upgrade)
+	LastPunch  time.Time
+	PunchFails int          // consecutive punch failures
+	Crypto     *PeerCrypto  // encryption state
 }
 
 // TunnelOpen is sent to request opening a tunnel to a peer's local port.

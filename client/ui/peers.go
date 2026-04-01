@@ -25,9 +25,23 @@ func (p *PeersPanel) Layout(gtx layout.Context, th *material.Theme, a *App) layo
 	peers := make([]peerRow, 0, len(a.Peers))
 	for _, peer := range a.Peers {
 		mode := "-"
+		isSelf := false
 		if a.Client != nil {
 			if peer.ID == a.Client.MyID {
-				mode = "YOU"
+				isSelf = true
+				// Show self's best connection mode across all peers
+				stun := a.Client.StunStatus()
+				if stun.Enabled {
+					mode = "RELAY" // default if STUN is active
+					for _, m := range stun.PeerConns {
+						if m == "direct" {
+							mode = "P2P"
+							break
+						}
+					}
+				} else {
+					mode = "RELAY"
+				}
 			} else {
 				mode = a.Client.PeerMode(peer.ID)
 			}
@@ -35,6 +49,9 @@ func (p *PeersPanel) Layout(gtx layout.Context, th *material.Theme, a *App) layo
 		name := peer.Name
 		if name == "" {
 			name = shortID(peer.ID)
+		}
+		if isSelf {
+			name = name + " (you)"
 		}
 		peers = append(peers, peerRow{
 			ID:       peer.ID,

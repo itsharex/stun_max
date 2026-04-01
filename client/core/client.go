@@ -512,14 +512,44 @@ func (c *Client) reconnect() bool {
 			Payload: json.RawMessage(joinPayload),
 		})
 
-		// Re-announce STUN info
-		if c.publicAddr != "" {
-			c.sendStunInfo("")
+		// Reset all P2P state — old connections are dead after network change
+		c.resetP2PState()
+
+		// Re-discover STUN (network may have changed, old public addr is stale)
+		if !c.Config.NoSTUN {
+			servers := c.Config.STUNServers
+			if len(servers) == 0 {
+				servers = []string{"stun.cloudflare.com:3478", "stun.miwifi.com:3478"}
+			}
+			go c.DiscoverSTUN(servers)
 		}
 
 		c.emit(EventReconnected, LogEvent{Level: "info", Message: fmt.Sprintf("Reconnected (ID: %s)", c.MyID)})
 		return true
 	}
+}
+
+// resetP2PState clears all stale P2P connections after a reconnect.
+func (c *Client) resetP2PState() {
+	// Close old UDP socket
+	if c.udpConn != nil {
+		c.udpConn.Close()
+		c.udpConn = nil
+	}
+	c.publicAddr = ""
+
+	// Reset all peer connections to "connecting"
+	c.peerConnsMu.Lock()
+	for _, pc := range c.peerConns {
+		if pc.DirectTCP != nil {
+			pc.DirectTCP.Close()
+			pc.DirectTCP = nil
+		}
+		pc.Mode = "connecting"
+		pc.UDPAddr = nil
+		pc.Crypto = nil
+	}
+	c.peerConnsMu.Unlock()
 }
 
 func splitMessages(data []byte) [][]byte {

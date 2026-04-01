@@ -416,8 +416,10 @@ func (c *Client) onHolePunchSuccess(peerID string, addr *net.UDPAddr) {
 		c.peerConnsMu.Unlock()
 		return
 	}
+	wasRelay := pc.Mode == "relay"
 	pc.Mode = "direct"
 	pc.UDPAddr = addr
+	pc.PunchFails = 0 // reset on success
 
 	if pc.Crypto == nil {
 		crypto, err := NewPeerCrypto()
@@ -427,6 +429,9 @@ func (c *Client) onHolePunchSuccess(peerID string, addr *net.UDPAddr) {
 	}
 	c.peerConnsMu.Unlock()
 
+	if wasRelay {
+		c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf("Upgraded %s from RELAY to P2P", shortID(peerID))})
+	}
 	c.emit(EventHolePunchSuccess, PeerEvent{ID: peerID, Status: "direct"})
 	c.sendStatusUpdate("direct")
 	c.sendKeyExchange(peerID)
@@ -752,7 +757,6 @@ func (c *Client) startRetryLoop() {
 			return
 
 		case <-keepaliveTicker.C:
-			// Send keepalive to all direct peers to prevent NAT mapping expiry
 			c.peerConnsMu.RLock()
 			for _, pc := range c.peerConns {
 				if pc.Mode == "direct" && pc.UDPAddr != nil && c.udpConn != nil {
@@ -762,16 +766,34 @@ func (c *Client) startRetryLoop() {
 			c.peerConnsMu.RUnlock()
 
 		case <-retryTicker.C:
-			c.peerConnsMu.RLock()
+			c.peerConnsMu.Lock()
 			var retryPeers []string
 			for peerID, pc := range c.peerConns {
-				if pc.Mode != "direct" && pc.UDPAddr != nil {
-					retryPeers = append(retryPeers, peerID)
+				if pc.UDPAddr == nil {
+					continue
 				}
+				if pc.Mode == "direct" {
+					continue // already connected
+				}
+				// After 5 failed punches, mark as relay (but keep retrying)
+				if pc.Mode == "connecting" && pc.PunchFails >= 5 {
+					pc.Mode = "relay"
+					c.emit(EventLog, LogEvent{Level: "warn", Message: fmt.Sprintf("P2P punch failed 5 times for %s, using relay", shortID(peerID))})
+				}
+				retryPeers = append(retryPeers, peerID)
 			}
-			c.peerConnsMu.RUnlock()
+			c.peerConnsMu.Unlock()
+
 			for _, peerID := range retryPeers {
-				go c.attemptHolePunch(peerID, false) // retry is always WAN-style
+				go func(pid string) {
+					c.attemptHolePunch(pid, false)
+					// If punch didn't succeed, increment failure counter
+					c.peerConnsMu.Lock()
+					if pc, ok := c.peerConns[pid]; ok && pc.Mode != "direct" {
+						pc.PunchFails++
+					}
+					c.peerConnsMu.Unlock()
+				}(peerID)
 			}
 		}
 	}
