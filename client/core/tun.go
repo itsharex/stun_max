@@ -34,12 +34,6 @@ type TunDevice struct {
 	done      chan struct{}
 	closeOnce sync.Once
 	mu        sync.Mutex
-
-	// Userspace SNAT: replace src IP in outgoing packets with B's real LAN IP
-	// so that target hosts can reply. Reverse on incoming replies.
-	snatEnabled bool
-	snatIP      net.IP // B's real LAN IP (e.g., 10.88.51.8)
-	snatPeerIP  net.IP // A's virtual IP (e.g., 10.7.0.3) — original src to restore
 }
 
 // Virtual IP allocator: simple counter within 10.7.0.0/24
@@ -196,19 +190,10 @@ func (c *Client) handleTunSetup(msg Message) {
 	}
 	dev.routes = setup.Routes
 
-	// B side: enable IP forwarding + userspace SNAT for subnet routing
+	// B side: enable IP forwarding for subnet routing
 	if len(setup.Routes) > 0 {
 		enableIPForwarding()
-		// Userspace SNAT: replace peer's virtual IP with our real LAN IP
-		// so target hosts can reply to us, then we reverse-NAT the replies
-		realIP := net.ParseIP(getLocalIP())
-		if realIP != nil {
-			dev.snatEnabled = true
-			dev.snatIP = realIP.To4()
-			dev.snatPeerIP = net.ParseIP(setup.PeerIP).To4()
-			c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf("Userspace SNAT: %s → %s", setup.PeerIP, realIP)})
-		}
-		enableNAT(dev.ifName) // still try kernel NAT as backup
+		enableNAT(dev.ifName)
 		c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf("IP forwarding enabled for routes: %v", setup.Routes)})
 
 		// Verify forwarding status
@@ -265,18 +250,6 @@ func (c *Client) handleTunData(msg Message) {
 	}
 
 	atomic.AddInt64(&dev.bytesDown, int64(len(raw)))
-
-	// Userspace SNAT: replace source IP (peer's virtual IP → our real LAN IP)
-	// so target hosts reply to us, not to the unreachable virtual IP
-	if dev.snatEnabled && len(raw) >= 20 && (raw[0]>>4) == 4 {
-		copy(raw[12:16], dev.snatIP.To4()) // replace src IP
-		// Recalculate IP header checksum
-		raw[10] = 0
-		raw[11] = 0
-		ihl := int(raw[0]&0x0f) * 4
-		csum := ipHeaderChecksum(raw[:ihl])
-		binary.BigEndian.PutUint16(raw[10:12], csum)
-	}
 
 	dev.mu.Lock()
 	defer dev.mu.Unlock()
@@ -339,21 +312,6 @@ func (c *Client) tunReadLoop(dev *TunDevice) {
 
 		packet := make([]byte, n)
 		copy(packet, buf[:n])
-
-		// Reverse SNAT: if this is a reply to a SNATted packet,
-		// replace dst IP (our real LAN IP) back to peer's virtual IP
-		if dev.snatEnabled && len(packet) >= 20 && (packet[0]>>4) == 4 {
-			dstIP := net.IP(packet[16:20])
-			if dstIP.Equal(dev.snatIP) {
-				copy(packet[16:20], dev.snatPeerIP.To4()) // restore dst to peer's virtual IP
-				// Recalculate IP header checksum
-				packet[10] = 0
-				packet[11] = 0
-				ihl := int(packet[0]&0x0f) * 4
-				csum := ipHeaderChecksum(packet[:ihl])
-				binary.BigEndian.PutUint16(packet[10:12], csum)
-			}
-		}
 
 		atomic.AddInt64(&dev.bytesUp, int64(n))
 
