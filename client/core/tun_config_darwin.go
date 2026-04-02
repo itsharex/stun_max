@@ -97,12 +97,24 @@ func enableIPForwarding() {
 }
 
 func enableNAT(ifName string) {
-	// Masquerade: packets from VPN subnet going out any physical interface
-	// Try common interface names
-	for _, phys := range []string{"en0", "en1", "en2", "en3"} {
-		exec.Command("bash", "-c",
-			fmt.Sprintf(`echo "nat on %s from 10.7.0.0/24 to any -> (%s)" | pfctl -ef - 2>/dev/null`, phys, phys)).Run()
+	// Find the active physical interface with a default route
+	out, err := exec.Command("route", "-n", "get", "default").CombinedOutput()
+	if err != nil {
+		return
 	}
+	phys := ""
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "interface:") {
+			phys = strings.TrimSpace(strings.TrimPrefix(line, "interface:"))
+			break
+		}
+	}
+	if phys == "" || phys == ifName {
+		return
+	}
+	exec.Command("bash", "-c",
+		fmt.Sprintf(`echo "nat on %s from 10.7.0.0/24 to any -> (%s)" | pfctl -ef - 2>/dev/null`, phys, phys)).Run()
 }
 
 func disableNAT(ifName string) {
