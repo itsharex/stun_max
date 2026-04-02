@@ -3,22 +3,61 @@
 package core
 
 import (
+	"fmt"
 	"os/exec"
 
-	"github.com/songgao/water"
+	"golang.zx2c4.com/wireguard/tun"
 )
 
-// waterIface wraps water.Interface to implement tunIface.
-type waterIface struct {
-	*water.Interface
+type wgTunIface struct {
+	dev  tun.Device
+	name string
+}
+
+func (w *wgTunIface) Read(b []byte) (int, error) {
+	bufs := [][]byte{b}
+	sizes := make([]int, 1)
+	n, err := w.dev.Read(bufs, sizes, 0)
+	if err != nil {
+		return 0, err
+	}
+	if n == 0 {
+		return 0, fmt.Errorf("no packets read")
+	}
+	return sizes[0], nil
+}
+
+func (w *wgTunIface) Write(b []byte) (int, error) {
+	bufs := [][]byte{b}
+	n, err := w.dev.Write(bufs, 0)
+	if err != nil {
+		return 0, err
+	}
+	if n == 0 {
+		return 0, fmt.Errorf("no packets written")
+	}
+	return len(b), nil
+}
+
+func (w *wgTunIface) Close() error {
+	return w.dev.Close()
+}
+
+func (w *wgTunIface) Name() string {
+	return w.name
 }
 
 func createPlatformTun() (tunIface, error) {
-	iface, err := water.New(water.Config{DeviceType: water.TUN})
+	dev, err := tun.CreateTUN("stunmax", 1500)
 	if err != nil {
+		return nil, fmt.Errorf("TUN creation failed: %w", err)
+	}
+	name, err := dev.Name()
+	if err != nil {
+		dev.Close()
 		return nil, err
 	}
-	return &waterIface{iface}, nil
+	return &wgTunIface{dev: dev, name: name}, nil
 }
 
 func configureTunInterface(ifName, localIP, peerIP string) error {
