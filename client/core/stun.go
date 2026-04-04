@@ -506,6 +506,35 @@ func (c *Client) handleKeyExchange(peerID string, peerPubKey []byte, addr *net.U
 	}
 }
 
+// dispatchSMMessage routes SM: signal messages to the appropriate handler.
+func (c *Client) dispatchSMMessage(msg Message) {
+	switch msg.Type {
+	case "st_begin":
+		c.handleSTBegin(msg)
+	case "st_ready":
+		c.handleSTReady(msg)
+	case "st_finish":
+		c.handleSTFinish(msg)
+	case "st_result":
+		c.handleSTResult(msg)
+	case "file_offer":
+		c.handleFileOffer(msg)
+	case "file_accept":
+		c.handleFileAccept(msg)
+	case "file_done":
+		c.handleFileDone(msg)
+	case "file_reject":
+		c.handleFileReject(msg)
+	case "file_cancel":
+		c.handleFileCancel(msg)
+	case "file_nack":
+		c.handleFileNack(msg)
+	case "file_stream":
+		c.handleFileStream(msg)
+	}
+}
+
+
 func (c *Client) udpReadLoop() {
 	defer c.wg.Done()
 	buf := make([]byte, 65536)
@@ -677,20 +706,8 @@ func (c *Client) udpReadLoop() {
 						c.handleSTFinish(inner)
 					case "st_result":
 						c.handleSTResult(inner)
-					case "file_offer":
-						c.handleFileOffer(inner)
-					case "file_accept":
-						c.handleFileAccept(inner)
-					case "file_done":
-						c.handleFileDone(inner)
-					case "file_reject":
-						c.handleFileReject(inner)
-					case "file_cancel":
-						c.handleFileCancel(inner)
-					case "file_nack":
-						c.handleFileNack(inner)
-					case "file_stream":
-						c.handleFileStream(inner)
+					default:
+						c.dispatchSMMessage(inner)
 					}
 				}
 			}

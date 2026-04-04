@@ -272,6 +272,13 @@ func (c *Client) FileTransfers() []FileTransferInfo {
 // --- Internal message handlers ---
 
 func (c *Client) handleFileOffer(msg Message) {
+	// Security check: is incoming file receive allowed?
+	if !c.AllowFileRecv() {
+		c.emit(EventLog, LogEvent{Level: "warn", Message: "Rejected file offer from " + shortID(msg.From) + " (file receive disabled)"})
+		c.sendRelay(msg.From, "file_reject", FileReject{Reason: "file receive disabled"})
+		return
+	}
+
 	var offer FileOffer
 	if err := json.Unmarshal(msg.Payload, &offer); err != nil {
 		return
@@ -872,15 +879,7 @@ func (c *Client) sendFileP2P(peerID string, udpMsg []byte) bool {
 		return false
 	}
 
-	c.connMu.Lock()
-	udp := c.udpConn
-	c.connMu.Unlock()
-	if udp == nil {
-		return false
-	}
-
-	_, err := udp.WriteToUDP(udpMsg, pc.UDPAddr)
-	return err == nil
+	return c.udpSend(udpMsg, pc.UDPAddr) == nil
 }
 
 // processFileDataP2P handles file data received via P2P UDP (SF: prefix).

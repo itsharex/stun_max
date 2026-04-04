@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## 2026-04-05 - Security Settings + Performance Tuning + Stability Fixes
+
+### Security Settings
+- **Allow Incoming VPN** toggle — prevent peers from force-opening VPN on your device
+- **Allow File Receive** toggle — prevent peers from sending unsolicited files
+- Both settings persist in config.json, applied on connect
+- `handleTunSetup` and `handleFileOffer` gated with security checks, rejected with log warning
+
+### Performance Tuning
+- gVisor MTU: 1400 → 1472 (max UDP without fragmentation)
+- gVisor channel buffer: 1024 → 2048
+- TCP send/receive buffer: 256KB → 1MB default, 4MB → 16MB max
+- Forward netstack: skip deflate compression (forwarded data mostly TLS/encrypted)
+- TUN netstack: use tunCompress smart bypass (skip QUIC/RTP/HTTPS)
+- Removed per-packet debug logging from forward netstack
+
+### Stability Fixes
+- TUN read loop: immediate exit on "file already closed" / "bad file descriptor" (no more 10-error cascade after VPN restart)
+- Reverted multi-hole UDP punching (caused packet reordering instability) — back to single stable hole
+
 ## 2026-04-04 - Multi-VPN + Route Append + UI Improvements
 
 ### Multi-VPN Support

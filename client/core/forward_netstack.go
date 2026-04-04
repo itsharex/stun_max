@@ -64,7 +64,7 @@ func newForwardNetstack(client *Client, peerID string, isInitiator bool) (*forwa
 		HandleLocal:        false,
 	})
 
-	ep := channel.New(1024, 1400, "")
+	ep := channel.New(2048, 1472, "")
 
 	if tcpipErr := s.CreateNIC(fwdNICID, ep); tcpipErr != nil {
 		return nil, fmt.Errorf("CreateNIC: %v", tcpipErr)
@@ -74,12 +74,12 @@ func newForwardNetstack(client *Client, peerID string, isInitiator bool) (*forwa
 	s.SetSpoofing(fwdNICID, true)
 	s.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: fwdNICID})
 
-	// TCP tuning
+	// TCP tuning — large buffers for high throughput
 	sackOpt := tcpip.TCPSACKEnabled(true)
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sackOpt)
-	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 262144, Max: 4194304}
+	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 1048576, Max: 16777216}
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf)
-	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: 262144, Max: 4194304}
+	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: 1048576, Max: 16777216}
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBuf)
 
 	// Assign local IP
@@ -129,11 +129,6 @@ func (fn *forwardNetstack) InjectInbound(pkt []byte) {
 	if len(pkt) < 20 {
 		return
 	}
-	proto := pkt[9]
-	fn.client.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf(
-		"fwd-ns IN: %d bytes proto=%d src=%d.%d.%d.%d dst=%d.%d.%d.%d",
-		len(pkt), proto, pkt[12], pkt[13], pkt[14], pkt[15], pkt[16], pkt[17], pkt[18], pkt[19])})
-
 	pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buffer.MakeWithData(append([]byte(nil), pkt...)),
 	})
@@ -155,41 +150,31 @@ func (fn *forwardNetstack) outboundLoop() {
 		view.Release()
 		pkt.DecRef()
 
-		if len(buf) >= 20 {
-			proto := buf[9]
-			fn.client.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf(
-				"fwd-ns OUT: %d bytes proto=%d src=%d.%d.%d.%d dst=%d.%d.%d.%d",
-				len(buf), proto, buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19])})
-		}
-
-		// Send via P2P UDP with "FN:" prefix, or relay
-		compressed := Compress(buf)
-		fn.sendPacket(compressed)
+		// Skip deflate — forwarded data is mostly TLS/encrypted (incompressible).
+		// Use raw framing (0x00 header) to stay compatible with Decompress on receive side.
+		raw := make([]byte, 1+len(buf))
+		raw[0] = 0x00
+		copy(raw[1:], buf)
+		fn.sendPacket(raw)
 	}
 }
 
-func (fn *forwardNetstack) sendPacket(compressed []byte) {
-	// Try P2P UDP with "FN:" prefix
+func (fn *forwardNetstack) sendPacket(data []byte) {
 	fn.client.peerConnsMu.RLock()
 	pc := fn.client.peerConns[fn.peerID]
 	fn.client.peerConnsMu.RUnlock()
 
 	if pc != nil && pc.Mode == "direct" && pc.UDPAddr != nil {
-		fn.client.connMu.Lock()
-		udpConn := fn.client.udpConn
-		fn.client.connMu.Unlock()
-		if udpConn != nil {
-			msg := make([]byte, 3+len(compressed))
-			copy(msg[:3], []byte("FN:"))
-			copy(msg[3:], compressed)
-			if _, err := udpConn.WriteToUDP(msg, pc.UDPAddr); err == nil {
-				return
-			}
+		msg := make([]byte, 3+len(data))
+		copy(msg[:3], []byte("FN:"))
+		copy(msg[3:], data)
+		if fn.client.udpSend(msg, pc.UDPAddr) == nil {
+			return
 		}
 	}
 
 	// Relay fallback
-	encoded := base64.StdEncoding.EncodeToString(compressed)
+	encoded := base64.StdEncoding.EncodeToString(data)
 	fn.client.sendRelay(fn.peerID, "fwd_data", TunData{Data: encoded})
 }
 

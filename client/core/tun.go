@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -363,6 +364,13 @@ func (c *Client) createTunDevice(localIP, peerIP, subnet, peerID string) (*TunDe
 
 // handleTunSetup processes an incoming tun_setup from a peer (B side).
 func (c *Client) handleTunSetup(msg Message) {
+	// Security check: is incoming VPN allowed?
+	if !c.AllowVPN() {
+		c.emit(EventLog, LogEvent{Level: "warn", Message: "Rejected VPN setup from " + shortID(msg.From) + " (incoming VPN disabled)"})
+		c.sendRelay(msg.From, "tun_teardown", TunTeardown{})
+		return
+	}
+
 	var setup TunSetup
 	if err := json.Unmarshal(msg.Payload, &setup); err != nil {
 		c.emit(EventTunError, LogEvent{Level: "error", Message: "Invalid tun_setup: " + err.Error()})
@@ -752,6 +760,11 @@ func (c *Client) tunReadLoop(dev *TunDevice) {
 				return
 			default:
 			}
+			// If device is closed, stop immediately — don't retry
+			errStr := err.Error()
+			if strings.Contains(errStr, "closed") || strings.Contains(errStr, "bad file descriptor") {
+				return
+			}
 			errCount++
 			if errCount >= 10 {
 				c.emit(EventTunError, LogEvent{Level: "error", Message: "TUN read: too many errors, stopping"})
@@ -937,20 +950,12 @@ func (c *Client) tunSendUDP(peerID string, compressed []byte) bool {
 		return false
 	}
 
-	c.connMu.Lock()
-	udp := c.udpConn
-	c.connMu.Unlock()
-	if udp == nil {
-		return false
-	}
-
 	// Prefix with "VPN:" to distinguish from other UDP messages
 	msg := make([]byte, 4+len(compressed))
 	copy(msg[:4], []byte("VPN:"))
 	copy(msg[4:], compressed)
 
-	_, err := udp.WriteToUDP(msg, pc.UDPAddr)
-	return err == nil
+	return c.udpSend(msg, pc.UDPAddr) == nil
 }
 
 // applyReverseSNAT checks if a packet from TUN is a reply to a SNAT'd connection.

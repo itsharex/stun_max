@@ -261,6 +261,22 @@ func (a *App) DoConnect(cfg core.ClientConfig) {
 		a.Dashboard.Files.autoAcceptClient = client
 		a.mu.Unlock()
 
+		// Apply security settings from config
+		if cfg := LoadConfig(); cfg != nil {
+			if cfg.AllowForward != nil {
+				client.SetAllowForward(*cfg.AllowForward)
+			}
+			if cfg.LocalOnly != nil {
+				client.SetLocalOnly(*cfg.LocalOnly)
+			}
+			if cfg.AllowVPN != nil {
+				client.SetAllowVPN(*cfg.AllowVPN)
+			}
+			if cfg.AllowFileRecv != nil {
+				client.SetAllowFileRecv(*cfg.AllowFileRecv)
+			}
+		}
+
 		// Channel to wait for join result
 		joinResult := make(chan bool, 1)
 		go func() {

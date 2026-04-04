@@ -52,7 +52,7 @@ func newNetstackProxy(dev *TunDevice, client *Client) (*netstackProxy, error) {
 		HandleLocal:        false,
 	})
 
-	ep := channel.New(1024, 1400, "")
+	ep := channel.New(2048, 1472, "")
 
 	if tcpipErr := s.CreateNIC(netstackNICID, ep); tcpipErr != nil {
 		return nil, fmt.Errorf("CreateNIC: %v", tcpipErr)
@@ -65,12 +65,12 @@ func newNetstackProxy(dev *TunDevice, client *Client) (*netstackProxy, error) {
 	// Default route: all traffic goes through our NIC
 	s.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: netstackNICID})
 
-	// TCP tuning for streaming
+	// TCP tuning — large buffers for streaming
 	sackOpt := tcpip.TCPSACKEnabled(true)
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sackOpt)
-	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 262144, Max: 4194304}
+	rcvBuf := tcpip.TCPReceiveBufferSizeRangeOption{Min: 4096, Default: 1048576, Max: 16777216}
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &rcvBuf)
-	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: 262144, Max: 4194304}
+	sndBuf := tcpip.TCPSendBufferSizeRangeOption{Min: 4096, Default: 1048576, Max: 16777216}
 	s.SetTransportProtocolOption(tcp.ProtocolNumber, &sndBuf)
 
 	np := &netstackProxy{
@@ -131,7 +131,7 @@ func (np *netstackProxy) outboundLoop() {
 
 		atomic.AddInt64(&np.dev.bytesUp, int64(len(buf)))
 
-		compressed := Compress(buf)
+		compressed := tunCompress(buf)
 		if np.client.tunSendUDP(np.dev.peerID, compressed) {
 			continue
 		}

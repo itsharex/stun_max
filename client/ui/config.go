@@ -17,8 +17,10 @@ type SavedConfig struct {
 	NoSTUN       bool           `json:"no_stun,omitempty"`
 	Autostart    bool           `json:"autostart,omitempty"`
 	AutoConnect  bool           `json:"auto_connect,omitempty"`
-	AllowForward *bool          `json:"allow_forward,omitempty"`
-	LocalOnly    *bool          `json:"local_only,omitempty"`
+	AllowForward    *bool          `json:"allow_forward,omitempty"`
+	LocalOnly       *bool          `json:"local_only,omitempty"`
+	AllowVPN        *bool          `json:"allow_vpn,omitempty"`
+	AllowFileRecv   *bool          `json:"allow_file_recv,omitempty"`
 	VirtualIP    string         `json:"virtual_ip,omitempty"`
 	Forwards     []SavedForward `json:"forwards,omitempty"`
 

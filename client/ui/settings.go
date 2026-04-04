@@ -25,9 +25,11 @@ var publicSTUNServers = []string{
 // SettingsPanel manages access control settings.
 type SettingsPanel struct {
 	List         widget.List
-	AllowForward widget.Bool
-	LocalOnly    widget.Bool
-	Autostart    widget.Bool
+	AllowForward  widget.Bool
+	LocalOnly     widget.Bool
+	AllowVPN      widget.Bool
+	AllowFileRecv widget.Bool
+	Autostart     widget.Bool
 	AutoConnect  widget.Bool
 	AutoLogin    widget.Bool
 
@@ -54,6 +56,8 @@ func (s *SettingsPanel) init(a *App) {
 	s.List.Axis = layout.Vertical
 	s.AllowForward.Value = true
 	s.LocalOnly.Value = true
+	s.AllowVPN.Value = true
+	s.AllowFileRecv.Value = true
 	s.Autostart.Value = GetAutostart()
 	if cfg := LoadConfig(); cfg != nil {
 		s.AutoConnect.Value = cfg.AutoConnect
@@ -62,6 +66,12 @@ func (s *SettingsPanel) init(a *App) {
 		}
 		if cfg.LocalOnly != nil {
 			s.LocalOnly.Value = *cfg.LocalOnly
+		}
+		if cfg.AllowVPN != nil {
+			s.AllowVPN.Value = *cfg.AllowVPN
+		}
+		if cfg.AllowFileRecv != nil {
+			s.AllowFileRecv.Value = *cfg.AllowFileRecv
 		}
 	}
 
@@ -135,6 +145,18 @@ func (s *SettingsPanel) Layout(gtx layout.Context, th *material.Theme, a *App) l
 			a.Client.SetLocalOnly(s.LocalOnly.Value)
 		}
 		saveBoolSetting(func(cfg *SavedConfig) { v := s.LocalOnly.Value; cfg.LocalOnly = &v })
+	}
+	if s.AllowVPN.Update(gtx) {
+		if a.Client != nil {
+			a.Client.SetAllowVPN(s.AllowVPN.Value)
+		}
+		saveBoolSetting(func(cfg *SavedConfig) { v := s.AllowVPN.Value; cfg.AllowVPN = &v })
+	}
+	if s.AllowFileRecv.Update(gtx) {
+		if a.Client != nil {
+			a.Client.SetAllowFileRecv(s.AllowFileRecv.Value)
+		}
+		saveBoolSetting(func(cfg *SavedConfig) { v := s.AllowFileRecv.Value; cfg.AllowFileRecv = &v })
 	}
 	if s.Autostart.Update(gtx) {
 		SetAutostart(s.Autostart.Value)
@@ -216,6 +238,20 @@ func (s *SettingsPanel) Layout(gtx layout.Context, th *material.Theme, a *App) l
 				"Local Only Mode",
 				"Only allow tunnels to localhost/127.0.0.1. Prevents LAN access.",
 				&s.LocalOnly,
+			)
+		},
+		func(gtx layout.Context) layout.Dimensions {
+			return s.layoutSettingCard(gtx, th,
+				"Allow Incoming VPN",
+				"When enabled, other peers can start a TUN VPN to route traffic through you.",
+				&s.AllowVPN,
+			)
+		},
+		func(gtx layout.Context) layout.Dimensions {
+			return s.layoutSettingCard(gtx, th,
+				"Allow File Receive",
+				"When enabled, other peers can send files to you. Files auto-save to Downloads/StunMax.",
+				&s.AllowFileRecv,
 			)
 		},
 		func(gtx layout.Context) layout.Dimensions {

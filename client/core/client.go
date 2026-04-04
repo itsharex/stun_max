@@ -52,6 +52,8 @@ type Client struct {
 	// Access control
 	allowForward bool // default true
 	localOnly    bool // default true
+	allowVPN     bool // default true — allow incoming VPN setup
+	allowFileRecv bool // default true — allow incoming file offers
 	acMu         sync.RWMutex
 
 	// Speed test tracking
@@ -114,8 +116,10 @@ func NewClient(cfg ClientConfig) *Client {
 		fwdNetstacks:  make(map[string]*forwardNetstack),
 		tunDevices:    make(map[string]*TunDevice),
 		tunAckChs:     make(map[string]chan string),
-		allowForward: true,
-		localOnly:    true,
+		allowForward:  true,
+		localOnly:     true,
+		allowVPN:      true,
+		allowFileRecv: true,
 		done:         make(chan struct{}),
 	}
 }
@@ -473,6 +477,42 @@ func (c *Client) LocalOnly() bool {
 	return c.localOnly
 }
 
+func (c *Client) SetAllowVPN(allow bool) {
+	c.acMu.Lock()
+	c.allowVPN = allow
+	c.acMu.Unlock()
+}
+
+func (c *Client) AllowVPN() bool {
+	c.acMu.RLock()
+	defer c.acMu.RUnlock()
+	return c.allowVPN
+}
+
+func (c *Client) SetAllowFileRecv(allow bool) {
+	c.acMu.Lock()
+	c.allowFileRecv = allow
+	c.acMu.Unlock()
+}
+
+func (c *Client) AllowFileRecv() bool {
+	c.acMu.RLock()
+	defer c.acMu.RUnlock()
+	return c.allowFileRecv
+}
+
+// udpSend sends data via the single UDP socket.
+func (c *Client) udpSend(data []byte, addr *net.UDPAddr) error {
+	c.connMu.Lock()
+	conn := c.udpConn
+	c.connMu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("no UDP socket")
+	}
+	_, err := conn.WriteToUDP(data, addr)
+	return err
+}
+
 // PeerMode returns the connection mode for a given peer.
 func (c *Client) PeerMode(peerID string) string {
 	c.peerConnsMu.RLock()
@@ -563,7 +603,6 @@ func (c *Client) sendRelay(to string, innerType string, innerPayload interface{}
 // udpPayload: raw bytes to send via UDP (prefix + payload)
 // relayType/relayPayload: for relay fallback
 func (c *Client) sendViaP2P(peerID string, udpPayload []byte, relayType string, relayPayload interface{}) {
-	// Try UDP P2P
 	c.peerConnsMu.RLock()
 	pc := c.peerConns[peerID]
 	var addr *net.UDPAddr
@@ -573,13 +612,8 @@ func (c *Client) sendViaP2P(peerID string, udpPayload []byte, relayType string, 
 	c.peerConnsMu.RUnlock()
 
 	if addr != nil {
-		c.connMu.Lock()
-		udp := c.udpConn
-		c.connMu.Unlock()
-		if udp != nil {
-			if _, err := udp.WriteToUDP(udpPayload, addr); err == nil {
-				return
-			}
+		if c.udpSend(udpPayload, addr) == nil {
+			return
 		}
 	}
 
