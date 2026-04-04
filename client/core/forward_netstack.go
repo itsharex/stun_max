@@ -48,7 +48,13 @@ type forwardNetstack struct {
 	cancel   context.CancelFunc
 	once     sync.Once
 	// B side: maps virtual port → real target address
-	portMap  sync.Map // uint16 → string ("host:port")
+	portMap     sync.Map // uint16 → string ("host:port")
+	filePortMap sync.Map // uint16 → *filePortEntry (file transfer handlers)
+}
+
+type filePortEntry struct {
+	ft     *activeFileTransfer
+	client *Client
 }
 
 func newForwardNetstack(client *Client, peerID string, isInitiator bool) (*forwardNetstack, error) {
@@ -208,14 +214,32 @@ func (fn *forwardNetstack) RegisterTarget(virtualPort uint16, target string) {
 		"fwd-ns: registered port %d → %s", virtualPort, target)})
 }
 
+// RegisterFileTransfer registers a virtual port for receiving a file stream.
+func (fn *forwardNetstack) RegisterFileTransfer(port uint16, ft *activeFileTransfer, client *Client) {
+	fn.filePortMap.Store(port, &filePortEntry{ft: ft, client: client})
+}
+
 // handleIncoming is called by gVisor for each new TCP connection from A (B side).
 func (fn *forwardNetstack) handleIncoming(r *tcp.ForwarderRequest) {
 	id := r.ID()
 	virtualPort := id.LocalPort
 
-	fn.client.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf(
-		"fwd-ns: incoming TCP from %s:%d to port %d", id.RemoteAddress, id.RemotePort, virtualPort)})
+	// Check if this is a file transfer port
+	if fval, fok := fn.filePortMap.LoadAndDelete(virtualPort); fok {
+		entry := fval.(*filePortEntry)
+		var wq waiter.Queue
+		ep, tcpipErr := r.CreateEndpoint(&wq)
+		if tcpipErr != nil {
+			r.Complete(true)
+			return
+		}
+		r.Complete(false)
+		conn := gonet.NewTCPConn(&wq, ep)
+		go fn.receiveFileStream(conn, entry.ft, entry.client)
+		return
+	}
 
+	// Regular forward port
 	val, ok := fn.portMap.Load(virtualPort)
 	if !ok {
 		fn.client.emit(EventLog, LogEvent{Level: "warn", Message: fmt.Sprintf(
@@ -265,6 +289,106 @@ func (fn *forwardNetstack) Close() {
 		fn.s.Close()
 		fn.ep.Close()
 	})
+}
+
+// receiveFileStream reads file data from a gVisor TCP connection and writes to disk.
+func (fn *forwardNetstack) receiveFileStream(conn net.Conn, ft *activeFileTransfer, client *Client) {
+	defer conn.Close()
+
+	ft.mu.Lock()
+	f := ft.File
+	fileSize := ft.FileSize
+	startTime := ft.StartTime
+	ft.mu.Unlock()
+
+	if f == nil {
+		return
+	}
+
+	client.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf(
+		"File stream receiving: %s (%s)", ft.FileName, fmtFileSize(fileSize))})
+
+	buf := make([]byte, 64*1024)
+	for {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		n, err := conn.Read(buf)
+		if n > 0 {
+			ft.mu.Lock()
+			if ft.File != nil {
+				ft.File.Write(buf[:n])
+			}
+			ft.BytesDone += int64(n)
+			bytesDone := ft.BytesDone
+			ft.mu.Unlock()
+
+			if bytesDone%(64*1024) < int64(n) {
+				progress := float64(0)
+				if fileSize > 0 {
+					progress = float64(bytesDone) / float64(fileSize)
+				}
+				speed := float64(0)
+				elapsed := time.Since(startTime).Seconds()
+				if elapsed > 0 {
+					speed = float64(bytesDone) / elapsed
+				}
+				client.emit(EventFileProgress, FileProgressEvent{
+					TransferID: ft.TransferID,
+					Progress:   progress,
+					Speed:      speed,
+					BytesDone:  bytesDone,
+				})
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	// TCP stream ended — close file and verify hash
+	ft.mu.Lock()
+	if ft.File != nil {
+		ft.File.Close()
+		ft.File = nil
+	}
+	bytesDone := ft.BytesDone
+	filePath := ft.FilePath
+	fileName := ft.FileName
+	expectedHash := ft.FileHash
+	ft.mu.Unlock()
+
+	// Verify SHA-256
+	verified := false
+	if expectedHash != "" && filePath != "" {
+		if actualHash, err := hashFile(filePath); err == nil {
+			if actualHash == expectedHash {
+				verified = true
+				client.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf(
+					"File hash verified: %s (SHA-256: %s)", fileName, actualHash[:16])})
+			} else {
+				client.emit(EventLog, LogEvent{Level: "error", Message: fmt.Sprintf(
+					"File hash MISMATCH: %s", fileName)})
+				ft.mu.Lock()
+				ft.Status = "error"
+				ft.mu.Unlock()
+				client.emit(EventFileError, FileErrorEvent{TransferID: ft.TransferID, Error: "hash mismatch"})
+				return
+			}
+		}
+	}
+
+	ft.mu.Lock()
+	ft.Status = "complete"
+	ft.mu.Unlock()
+
+	verifyStr := ""
+	if verified {
+		verifyStr = " (verified)"
+	}
+	client.emit(EventFileComplete, FileCompleteEvent{
+		TransferID: ft.TransferID, FileName: fileName, Direction: "receive",
+	})
+	client.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf(
+		"File received: %s (%s)%s", fileName, fmtFileSize(bytesDone), verifyStr)})
 }
 
 // getOrCreateFwdNetstack returns the forward netstack for a peer, creating one if needed.

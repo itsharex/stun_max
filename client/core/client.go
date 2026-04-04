@@ -1050,6 +1050,10 @@ func (c *Client) handleRelayData(msg Message) {
 		c.handleFileReject(inner)
 	case "file_cancel":
 		c.handleFileCancel(inner)
+	case "file_nack":
+		c.handleFileNack(inner)
+	case "file_stream":
+		c.handleFileStream(inner)
 	case "hop_forward":
 		c.handleHopForward(inner)
 	case "hop_forward_accept":

@@ -202,6 +202,7 @@ type FileOffer struct {
 // FileAccept is sent to accept a pending file offer.
 type FileAccept struct {
 	TransferID string `json:"transfer_id"`
+	Offset     int64  `json:"offset,omitempty"` // resume from this byte offset
 }
 
 // FileReject is sent to reject a pending file offer.
@@ -216,12 +217,21 @@ type FileData struct {
 	Data       string `json:"data"`
 	Seq        int    `json:"seq"`
 	Offset     int64  `json:"offset"`
+	ChunkHash  string `json:"chunk_hash,omitempty"` // CRC32 hex of raw (uncompressed) chunk
 }
 
 // FileDone signals that all chunks have been sent.
 type FileDone struct {
 	TransferID string `json:"transfer_id"`
 	TotalBytes int64  `json:"total_bytes"`
+	FileHash   string `json:"file_hash"` // SHA-256 hex for verification
+}
+
+// FileNack requests retransmission of specific chunks.
+type FileNack struct {
+	TransferID string `json:"transfer_id"`
+	Seq        int    `json:"seq"`    // chunk sequence number to retransmit
+	Offset     int64  `json:"offset"` // byte offset of the chunk
 }
 
 // FileCancel signals that a transfer has been cancelled.

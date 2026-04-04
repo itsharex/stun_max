@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/sqweek/dialog"
+
 	"gioui.org/layout"
 	"gioui.org/op/clip"
 	"gioui.org/op/paint"
@@ -23,10 +25,14 @@ import (
 type FilesPanel struct {
 	PathEditor widget.Editor
 	PeerSel    *PeerSelector
+	BrowseBtn  widget.Clickable
 	SendBtn    widget.Clickable
 	List       widget.List
 	Error      string
 	inited     bool
+
+	// Auto-accept: set to client reference to auto-accept incoming files
+	autoAcceptClient *core.Client
 
 	// Pending incoming offers
 	pendingOffers []core.FileOfferEvent
@@ -59,14 +65,38 @@ func (f *FilesPanel) init() {
 func (f *FilesPanel) handleOffer(offer core.FileOfferEvent) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Lazy init maps (handleOffer can be called before Layout/init)
+	if f.acceptBtns == nil {
+		f.acceptBtns = make(map[string]*widget.Clickable)
+	}
+	if f.rejectBtns == nil {
+		f.rejectBtns = make(map[string]*widget.Clickable)
+	}
+	if f.progressCache == nil {
+		f.progressCache = make(map[string]core.FileProgressEvent)
+	}
 	f.pendingOffers = append(f.pendingOffers, offer)
 	f.acceptBtns[offer.TransferID] = new(widget.Clickable)
 	f.rejectBtns[offer.TransferID] = new(widget.Clickable)
+
+	// Auto-accept: save to default download dir immediately
+	if f.autoAcceptClient != nil {
+		tid := offer.TransferID
+		fileName := offer.FileName
+		client := f.autoAcceptClient
+		go func() {
+			savePath := filepath.Join(defaultDownloadDir(), fileName)
+			client.AcceptFile(tid, savePath)
+		}()
+	}
 }
 
 func (f *FilesPanel) handleProgress(p core.FileProgressEvent) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.progressCache == nil {
+		f.progressCache = make(map[string]core.FileProgressEvent)
+	}
 	f.progressCache[p.TransferID] = p
 }
 
@@ -97,7 +127,9 @@ func (f *FilesPanel) handleError(e core.FileErrorEvent) {
 
 func defaultDownloadDir() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "Downloads", "StunMax")
+	dir := filepath.Join(home, "Downloads", "StunMax")
+	os.MkdirAll(dir, 0755) // ensure it exists
+	return dir
 }
 
 // PLACEHOLDER_LAYOUT
@@ -105,6 +137,17 @@ func defaultDownloadDir() string {
 // Layout renders the files panel.
 func (f *FilesPanel) Layout(gtx layout.Context, th *material.Theme, a *App) layout.Dimensions {
 	f.init()
+
+	// Handle browse button — open native file picker
+	if f.BrowseBtn.Clicked(gtx) {
+		go func() {
+			file, err := dialog.File().Title("Select file to send").Load()
+			if err == nil && file != "" {
+				f.PathEditor.SetText(file)
+				a.Window.Invalidate()
+			}
+		}()
+	}
 
 	// Handle send button
 	if f.SendBtn.Clicked(gtx) && a.Client != nil {
@@ -229,8 +272,19 @@ func (f *FilesPanel) layoutSendForm(gtx layout.Context, th *material.Theme, a *A
 								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 									return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx)
 								}),
-								layout.Flexed(0.5, func(gtx layout.Context) layout.Dimensions {
+								layout.Flexed(0.45, func(gtx layout.Context) layout.Dimensions {
 									return layoutInputField(gtx, th, &f.PathEditor, "File path")
+								}),
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									return layout.Spacer{Width: unit.Dp(4)}.Layout(gtx)
+								}),
+								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+									btn := material.Button(th, &f.BrowseBtn, "Browse")
+									btn.Background = InputBg
+									btn.Color = TextColor
+									btn.CornerRadius = unit.Dp(4)
+									btn.Inset = layout.Inset{Top: unit.Dp(8), Bottom: unit.Dp(8), Left: unit.Dp(12), Right: unit.Dp(12)}
+									return btn.Layout(gtx)
 								}),
 								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 									return layout.Spacer{Width: unit.Dp(8)}.Layout(gtx)

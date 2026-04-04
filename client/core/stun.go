@@ -633,6 +633,20 @@ func (c *Client) udpReadLoop() {
 			continue
 		}
 
+		// File data over UDP: "SF:" + compressed JSON
+		if n > 3 && string(data[:3]) == "SF:" {
+			compressed := data[3:]
+			payload, err := Decompress(compressed)
+			if err != nil {
+				continue
+			}
+			var fileData FileData
+			if err := json.Unmarshal(payload, &fileData); err == nil {
+				c.processFileDataP2P(fileData)
+			}
+			continue
+		}
+
 		// P2P signal message: "SM:<type>:<json>"
 		if n > 3 && string(data[:3]) == "SM:" {
 			rest := data[3:]
@@ -663,6 +677,20 @@ func (c *Client) udpReadLoop() {
 						c.handleSTFinish(inner)
 					case "st_result":
 						c.handleSTResult(inner)
+					case "file_offer":
+						c.handleFileOffer(inner)
+					case "file_accept":
+						c.handleFileAccept(inner)
+					case "file_done":
+						c.handleFileDone(inner)
+					case "file_reject":
+						c.handleFileReject(inner)
+					case "file_cancel":
+						c.handleFileCancel(inner)
+					case "file_nack":
+						c.handleFileNack(inner)
+					case "file_stream":
+						c.handleFileStream(inner)
 					}
 				}
 			}

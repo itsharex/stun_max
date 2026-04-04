@@ -13,8 +13,10 @@ require (
 
 require (
 	gioui.org/shader v1.0.8 // indirect
+	github.com/TheTitanrain/w32 v0.0.0-20180517000239-4f5cfb03fabf // indirect
 	github.com/go-text/typesetting v0.3.0 // indirect
 	github.com/google/btree v1.1.2 // indirect
+	github.com/sqweek/dialog v0.0.0-20260123140253-64c163d53aac // indirect
 	golang.org/x/exp/shiny v0.0.0-20250408133849-7e4ce0ab07d0 // indirect
 	golang.org/x/image v0.26.0 // indirect
 	golang.org/x/text v0.31.0 // indirect

@@ -258,6 +258,7 @@ func (a *App) DoConnect(cfg core.ClientConfig) {
 		// Start event consumer BEFORE joining so we can catch error/peer_list
 		a.mu.Lock()
 		a.Client = client
+		a.Dashboard.Files.autoAcceptClient = client
 		a.mu.Unlock()
 
 		// Channel to wait for join result
