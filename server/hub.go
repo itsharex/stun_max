@@ -26,12 +26,17 @@ type PeerInfo struct {
 	Endpoint string            `json:"endpoint,omitempty"` // STUN-discovered public UDP endpoint
 	NATType  string            `json:"nat_type,omitempty"` // NAT type: NAT1, NAT2, NAT3, NAT4
 	Features map[string]string `json:"features,omitempty"` // active features: vpn, forwards, files, etc.
+	IPInfo   *IPInfo           `json:"ip_info,omitempty"`  // geolocation + ASN (resolved server-side)
 }
 
 // RoomInfo is the API representation of a room for the web dashboard
 type RoomInfo struct {
 	Name         string     `json:"name"`
 	Protected    bool       `json:"protected"`
+	Persistent    bool       `json:"persistent"`
+	RelayDisabled bool       `json:"relay_disabled"`
+	OwnerName     string     `json:"owner_name,omitempty"`
+	OwnerID       string     `json:"owner_id,omitempty"`
 	Peers        []PeerInfo `json:"peers"`
 	BytesRelayed int64      `json:"bytes_relayed"`
 	CreatedAt    string     `json:"created_at,omitempty"`
@@ -48,25 +53,47 @@ type Room struct {
 	mu           sync.RWMutex
 	BytesRelayed int64     // atomic counter
 	CreatedAt    time.Time
+	OwnerID      string // client ID of the room creator (empty = dashboard-created)
+	OwnerName    string // display name of the owner
+	Persistent   bool   // true = dashboard-created, won't auto-delete
+	RelayDisabled bool  // true = relay blocked, P2P only
 }
 
 // Hub manages all rooms and clients
 type Hub struct {
 	rooms      map[string]*Room
+	store      *Store
 	mu         sync.RWMutex
 	register   chan *Client
 	unregister chan *Client
 }
 
-func newHub() *Hub {
-	return &Hub{
+func newHub(store *Store) *Hub {
+	h := &Hub{
 		rooms:      make(map[string]*Room),
+		store:      store,
 		register:   make(chan *Client, 64),
 		unregister: make(chan *Client, 64),
 	}
+
+	// Load persisted rooms from SQLite
+	if store != nil {
+		rooms := store.LoadRooms()
+		for _, room := range rooms {
+			h.rooms[room.Key] = room
+			log.Printf("Loaded room from DB: %s (protected: %v, banned: %d)",
+				room.Name, room.PasswordHash != "", len(room.Blacklist))
+		}
+	}
+
+	return h
 }
 
 func (h *Hub) run() {
+	// Periodic sync of relay bytes to SQLite (every 60s)
+	syncTicker := time.NewTicker(60 * time.Second)
+	defer syncTicker.Stop()
+
 	for {
 		select {
 		case client := <-h.register:
@@ -74,7 +101,21 @@ func (h *Hub) run() {
 		case client := <-h.unregister:
 			h.removeClientFromRoom(client)
 			log.Printf("Client unregistered: %s", client.id)
+		case <-syncTicker.C:
+			h.syncBytesToStore()
 		}
+	}
+}
+
+func (h *Hub) syncBytesToStore() {
+	if h.store == nil {
+		return
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, room := range h.rooms {
+		bytes := atomic.LoadInt64(&room.BytesRelayed)
+		h.store.UpdateBytesRelayed(room.Key, bytes)
 	}
 }
 
@@ -109,7 +150,9 @@ func (h *Hub) findRoomByName(name, passwordHash string) (*Room, string) {
 	return nil, "room does not exist"
 }
 
-func (h *Hub) getOrCreateRoom(name, passwordHash string) *Room {
+// getOrCreateRoom creates a room. If ownerID is set, the room is client-owned
+// (auto-deleted when owner leaves). If empty, the room is persistent (dashboard-created).
+func (h *Hub) getOrCreateRoom(name, passwordHash, ownerID, ownerName string) *Room {
 	key := roomKey(name, passwordHash)
 
 	h.mu.Lock()
@@ -118,6 +161,8 @@ func (h *Hub) getOrCreateRoom(name, passwordHash string) *Room {
 	if room, ok := h.rooms[key]; ok {
 		return room
 	}
+
+	persistent := ownerID == "" // dashboard-created = persistent
 	room := &Room{
 		Name:         name,
 		PasswordHash: passwordHash,
@@ -125,9 +170,22 @@ func (h *Hub) getOrCreateRoom(name, passwordHash string) *Room {
 		Clients:      make(map[string]*Client),
 		Blacklist:    make(map[string]bool),
 		CreatedAt:    time.Now(),
+		OwnerID:      ownerID,
+		OwnerName:    ownerName,
+		Persistent:   persistent,
 	}
 	h.rooms[key] = room
-	log.Printf("Room created: %s (protected: %v)", name, passwordHash != "")
+
+	if persistent {
+		log.Printf("Room created (persistent/dashboard): %s (protected: %v)", name, passwordHash != "")
+	} else {
+		log.Printf("Room created (client-owned by %s/%s): %s", ownerName, ownerID[:8], name)
+	}
+
+	if h.store != nil && persistent {
+		h.store.SaveRoom(room)
+	}
+
 	return room
 }
 
@@ -146,11 +204,43 @@ func (h *Hub) removeClientFromRoom(client *Client) {
 
 	room.mu.Lock()
 	delete(room.Clients, client.id)
+	isEmpty := len(room.Clients) == 0
+	isOwner := room.OwnerID != "" && room.OwnerID == client.id
+	persistent := room.Persistent
+	roomKey := room.Key
+	roomName := room.Name
 	room.mu.Unlock()
 
-	// Don't delete room when empty — rooms are created via dashboard
-	// and should persist until explicitly deleted by admin.
-	room.broadcastPeerList()
+	// Auto-delete client-owned room when owner leaves
+	if isOwner && !persistent {
+		// Owner left — disconnect remaining clients and delete room
+		log.Printf("Room owner %s left room %s — auto-deleting", client.id, roomName)
+		room.mu.Lock()
+		for _, c := range room.Clients {
+			errPayload, _ := json.Marshal(map[string]string{"error": "room closed (owner left)"})
+			errMsg := Message{Type: "error", Payload: json.RawMessage(errPayload)}
+			data, _ := json.Marshal(errMsg)
+			select {
+			case c.send <- data:
+			default:
+			}
+			close(c.send)
+		}
+		room.Clients = make(map[string]*Client)
+		room.mu.Unlock()
+
+		h.mu.Lock()
+		delete(h.rooms, roomKey)
+		h.mu.Unlock()
+	} else if isEmpty && !persistent {
+		// Non-persistent room with no clients — clean up
+		h.mu.Lock()
+		delete(h.rooms, roomKey)
+		h.mu.Unlock()
+		log.Printf("Empty non-persistent room %s removed", roomName)
+	} else {
+		room.broadcastPeerList()
+	}
 
 	client.room = ""
 	client.roomKey = ""
@@ -245,7 +335,7 @@ func (r *Room) getPeerList() []PeerInfo {
 
 	peers := make([]PeerInfo, 0, len(r.Clients))
 	for _, c := range r.Clients {
-		peers = append(peers, PeerInfo{
+		p := PeerInfo{
 			ID:       c.id,
 			Status:   c.status,
 			Name:     c.name,
@@ -253,7 +343,12 @@ func (r *Room) getPeerList() []PeerInfo {
 			Endpoint: c.endpoint,
 			NATType:  c.natType,
 			Features: c.features,
-		})
+		}
+		// IP info from cache (populated asynchronously when endpoint set)
+		if c.ipInfo != nil {
+			p.IPInfo = c.ipInfo
+		}
+		peers = append(peers, p)
 	}
 	return peers
 }
@@ -273,8 +368,12 @@ func (h *Hub) getRoomsInfo() []RoomInfo {
 		room.mu.RUnlock()
 
 		result = append(result, RoomInfo{
-			Name:         room.Name,
-			Protected:    room.PasswordHash != "",
+			Name:          room.Name,
+			Protected:     room.PasswordHash != "",
+			Persistent:    room.Persistent,
+			RelayDisabled: room.RelayDisabled,
+			OwnerName:     room.OwnerName,
+			OwnerID:       room.OwnerID,
 			Peers:        room.getPeerList(),
 			BytesRelayed: atomic.LoadInt64(&room.BytesRelayed),
 			CreatedAt:    room.CreatedAt.UTC().Format(time.RFC3339),
@@ -300,6 +399,9 @@ func (h *Hub) deleteRoom(name string) bool {
 	}
 	for _, key := range toDelete {
 		delete(h.rooms, key)
+		if h.store != nil {
+			h.store.DeleteRoom(key)
+		}
 	}
 	h.mu.Unlock()
 
@@ -337,6 +439,10 @@ func (h *Hub) banClient(roomName, clientID string) bool {
 	client, connected := targetRoom.Clients[clientID]
 	targetRoom.mu.Unlock()
 
+	if h.store != nil {
+		h.store.SaveBan(targetRoom.Key, clientID)
+	}
+
 	log.Printf("Client %s banned from room %s", clientID, roomName)
 
 	if connected {
@@ -351,6 +457,46 @@ func (h *Hub) banClient(roomName, clientID string) bool {
 		close(client.send)
 	}
 	return true
+}
+
+// kickClient disconnects a client from a room without banning.
+func (h *Hub) kickClient(roomName, clientID string) bool {
+	h.mu.RLock()
+	var targetRoom *Room
+	for _, room := range h.rooms {
+		if room.Name == roomName {
+			targetRoom = room
+			break
+		}
+	}
+	h.mu.RUnlock()
+
+	if targetRoom == nil {
+		return false
+	}
+
+	targetRoom.mu.Lock()
+	client, connected := targetRoom.Clients[clientID]
+	if connected {
+		delete(targetRoom.Clients, clientID)
+	}
+	targetRoom.mu.Unlock()
+
+	if connected {
+		errPayload, _ := json.Marshal(map[string]string{"error": "kicked by admin"})
+		errMsg := Message{Type: "error", Payload: json.RawMessage(errPayload)}
+		data, _ := json.Marshal(errMsg)
+		select {
+		case client.send <- data:
+		default:
+		}
+		close(client.send)
+		client.conn.Close()
+
+		targetRoom.broadcastPeerList()
+		log.Printf("Client %s kicked from room %s", clientID, roomName)
+	}
+	return connected
 }
 
 // unbanClient removes a client from the room blacklist
@@ -372,6 +518,10 @@ func (h *Hub) unbanClient(roomName, clientID string) bool {
 	targetRoom.mu.Lock()
 	delete(targetRoom.Blacklist, clientID)
 	targetRoom.mu.Unlock()
+
+	if h.store != nil {
+		h.store.DeleteBan(targetRoom.Key, clientID)
+	}
 
 	log.Printf("Client %s unbanned from room %s", clientID, roomName)
 	return true

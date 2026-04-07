@@ -102,7 +102,7 @@ func (c *Client) SendFile(peerID, filePath string) (string, error) {
 		Status:     "pending",
 		File:       f,
 		Done:       make(chan struct{}),
-		NackCh:     make(chan FileNack, 64),
+		NackCh:     make(chan FileNack, 256),
 	}
 
 	c.fileTransfersMu.Lock()
@@ -727,7 +727,8 @@ func (c *Client) handleFileCancel(msg Message) {
 	c.emit(EventLog, LogEvent{Level: "warn", Message: fmt.Sprintf("File transfer cancelled by %s", ft.PeerName)})
 }
 
-// sendFileChunks reads the file in 32KB chunks, compresses, and sends via P2P or relay.
+// sendFileChunks reads the file in chunks, compresses, and sends via P2P or relay.
+// Includes rate limiting for P2P UDP to prevent buffer overflow and packet loss.
 func (c *Client) sendFileChunks(ft *activeFileTransfer) {
 	defer c.wg.Done()
 
@@ -747,6 +748,17 @@ func (c *Client) sendFileChunks(ft *activeFileTransfer) {
 
 	buf := make([]byte, chunkSize)
 	seq := 0
+
+	// Rate limiter: limit P2P UDP send rate to prevent packet loss
+	// Allow burst of 32 packets, then pace to ~500 chunks/sec for P2P
+	var sendPacer <-chan time.Time
+	if useP2P {
+		ticker := time.NewTicker(2 * time.Millisecond) // ~500 chunks/sec × 1KB = ~500KB/s baseline
+		defer ticker.Stop()
+		sendPacer = ticker.C
+	}
+
+	consecutiveFailures := 0
 
 	for {
 		select {
@@ -777,8 +789,18 @@ func (c *Client) sendFileChunks(ft *activeFileTransfer) {
 				payload, _ := json.Marshal(fileData)
 				udpMsg := append([]byte("SF:"), Compress(payload)...)
 				if !c.sendFileP2P(ft.PeerID, udpMsg) {
-					// P2P failed, fallback to relay for this chunk
+					consecutiveFailures++
+					if consecutiveFailures > 10 {
+						// P2P is broken, switch to relay permanently
+						useP2P = false
+						chunkSize = fileChunkSizeRelay
+						buf = make([]byte, chunkSize)
+						sendPacer = nil
+						c.emit(EventLog, LogEvent{Level: "warn", Message: "P2P send failed repeatedly, switching to relay"})
+					}
 					sendErr = c.sendRelay(ft.PeerID, "file_data", fileData)
+				} else {
+					consecutiveFailures = 0
 				}
 			} else {
 				sendErr = c.sendRelay(ft.PeerID, "file_data", fileData)
@@ -800,6 +822,17 @@ func (c *Client) sendFileChunks(ft *activeFileTransfer) {
 			ft.mu.Unlock()
 			seq++
 
+			// P2P rate limiting: wait for pacer tick to prevent UDP buffer overflow
+			if sendPacer != nil {
+				select {
+				case <-sendPacer:
+				case <-ft.Done:
+					return
+				case <-c.done:
+					return
+				}
+			}
+
 			if seq%10 == 0 {
 				progress := float64(0)
 				if fileSize > 0 {
@@ -818,15 +851,19 @@ func (c *Client) sendFileChunks(ft *activeFileTransfer) {
 				})
 			}
 
-			// Re-check P2P status periodically (peer might upgrade/downgrade)
+			// Re-check P2P status periodically
 			if seq%100 == 0 {
 				newP2P := c.PeerMode(ft.PeerID) == "direct"
 				if newP2P != useP2P {
 					useP2P = newP2P
 					if useP2P {
 						chunkSize = fileChunkSizeP2P
+						ticker := time.NewTicker(2 * time.Millisecond)
+						defer ticker.Stop()
+						sendPacer = ticker.C
 					} else {
 						chunkSize = fileChunkSizeRelay
+						sendPacer = nil
 					}
 					buf = make([]byte, chunkSize)
 				}

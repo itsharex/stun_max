@@ -25,6 +25,7 @@ type activeSpeedTest struct {
 	UploadMbps      float64
 	Transport       string // "auto", "p2p", "relay"
 	ActualTransport string // resolved: "p2p" or "relay"
+	cancel          chan struct{}
 	mu              sync.Mutex
 }
 
@@ -53,6 +54,7 @@ func (c *Client) StartSpeedTest(peerID string, sizeMB int, mode string) (string,
 		TotalSize:       int64(sizeMB) * 1024 * 1024,
 		Transport:       mode,
 		ActualTransport: actual,
+		cancel:          make(chan struct{}),
 	}
 
 	c.speedTestsMu.Lock()
@@ -87,6 +89,100 @@ func (c *Client) StartSpeedTest(peerID string, sizeMB int, mode string) (string,
 	}()
 
 	return testID, nil
+}
+
+// cancelSpeedTestsForPeer cancels all speed tests with a specific peer.
+func (c *Client) cancelSpeedTestsForPeer(peerID string) {
+	c.speedTestsMu.Lock()
+	var toCancel []string
+	for id, t := range c.speedTests {
+		if t.PeerID == peerID && t.Phase != "done" {
+			toCancel = append(toCancel, id)
+		}
+	}
+	c.speedTestsMu.Unlock()
+
+	for _, id := range toCancel {
+		c.CancelSpeedTest(id)
+	}
+}
+
+// CancelSpeedTest cancels a running speed test by ID.
+func (c *Client) CancelSpeedTest(testID string) {
+	c.speedTestsMu.Lock()
+	test, ok := c.speedTests[testID]
+	if ok {
+		delete(c.speedTests, testID)
+	}
+	c.speedTestsMu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	// Signal cancel to send loop
+	select {
+	case <-test.cancel:
+	default:
+		close(test.cancel)
+	}
+
+	// Notify peer
+	c.stSignalWith(test.PeerID, test.ActualTransport, "st_cancel", map[string]string{"test_id": testID})
+
+	c.emit(EventSpeedTestResult, SpeedTestResult{
+		TestID: testID, PeerID: test.PeerID,
+		Error: "cancelled", Done: true, Transport: test.ActualTransport,
+	})
+	c.emit(EventLog, LogEvent{Level: "info", Message: "Speed test cancelled"})
+}
+
+// CancelAllSpeedTests cancels all running speed tests.
+func (c *Client) CancelAllSpeedTests() {
+	c.speedTestsMu.Lock()
+	var ids []string
+	for id := range c.speedTests {
+		ids = append(ids, id)
+	}
+	c.speedTestsMu.Unlock()
+
+	for _, id := range ids {
+		c.CancelSpeedTest(id)
+	}
+}
+
+// handleSTCancel processes a cancel message from the peer.
+func (c *Client) handleSTCancel(msg Message) {
+	var info struct {
+		TestID string `json:"test_id"`
+	}
+	json.Unmarshal(msg.Payload, &info)
+	if info.TestID == "" {
+		return
+	}
+
+	c.speedTestsMu.Lock()
+	test, ok := c.speedTests[info.TestID]
+	if ok {
+		delete(c.speedTests, info.TestID)
+	}
+	c.speedTestsMu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	select {
+	case <-test.cancel:
+	default:
+		close(test.cancel)
+	}
+
+	c.emit(EventSpeedTestResult, SpeedTestResult{
+		TestID: info.TestID, PeerID: test.PeerID,
+		Error: "cancelled by peer", Done: true, Transport: test.ActualTransport,
+	})
+	c.emit(EventLog, LogEvent{Level: "info", Message: "Speed test cancelled by peer"})
 }
 
 // stSignal sends a signal message via the test's resolved transport.
@@ -236,6 +332,15 @@ func (c *Client) stSendData(test *activeSpeedTest) {
 	var sent int64
 	seq := 0
 	for sent < test.TotalSize {
+		// Check cancel
+		select {
+		case <-test.cancel:
+			return
+		case <-c.done:
+			return
+		default:
+		}
+
 		remaining := test.TotalSize - sent
 		thisChunk := chunk
 		if remaining < int64(len(chunk)) {

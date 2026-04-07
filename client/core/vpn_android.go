@@ -307,7 +307,20 @@ static int startVpnService(JNIEnv* env, jobject context) {
 static int vpnEstablish(JNIEnv* env, jobject context,
     const char* localIP, const char* peerIP, const char* routes, int mtu) {
 
-    jclass bridgeClass = FindClassFromContext(env, context, "com.stunmax.app.GoBridge");
+    if (!env || !context) {
+        LOGE("vpnEstablish: env or context is NULL");
+        return -1;
+    }
+
+    // Create a global ref to protect context from GC during this call
+    jobject safeCtx = (*env)->NewGlobalRef(env, context);
+    if (!safeCtx) {
+        LOGE("vpnEstablish: failed to create global ref for context (dangling?)");
+        (*env)->ExceptionClear(env);
+        return -1;
+    }
+
+    jclass bridgeClass = FindClassFromContext(env, safeCtx, "com.stunmax.app.GoBridge");
     if (!bridgeClass) {
         LOGE("GoBridge class not found in APK (multidex?)");
         (*env)->ExceptionClear(env);
@@ -342,6 +355,7 @@ static int vpnEstablish(JNIEnv* env, jobject context,
     (*env)->DeleteLocalRef(env, jRoutes);
     (*env)->DeleteLocalRef(env, jDns);
     (*env)->DeleteLocalRef(env, bridgeClass);
+    (*env)->DeleteGlobalRef(env, safeCtx);
 
     return fd;
 }
@@ -503,6 +517,14 @@ func androidEstablishVPN(localIP, peerIP, routes string, mtu int) (int, error) {
 		if env == nil {
 			return -1, fmt.Errorf("failed to re-attach thread after VPN permission grant")
 		}
+
+		// Re-acquire context — the old jobject ref may be invalid after activity lifecycle
+		ctx2 := app.AppContext()
+		if ctx2 == 0 {
+			C.DetachThread(vm)
+			return -1, fmt.Errorf("Android context lost after VPN permission")
+		}
+		context = C.jobject(unsafe.Pointer(ctx2))
 	}
 	defer C.DetachThread(vm)
 
@@ -516,6 +538,20 @@ func androidEstablishVPN(localIP, peerIP, routes string, mtu int) (int, error) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Step 4: Establish VPN through GoBridge -> VpnService
+	// Re-acquire env and context — startVpnService may have triggered GC
+	// or Activity lifecycle changes that invalidate the old jobject refs.
+	C.DetachThread(vm)
+	env = C.GetEnv(vm)
+	if env == nil {
+		return -1, fmt.Errorf("failed to re-attach JNI thread before establish")
+	}
+	freshCtx := app.AppContext()
+	if freshCtx == 0 {
+		C.DetachThread(vm)
+		return -1, fmt.Errorf("Android context lost before establish")
+	}
+	context = C.jobject(unsafe.Pointer(freshCtx))
+
 	cLocalIP := C.CString(localIP)
 	cPeerIP := C.CString(peerIP)
 	cRoutes := C.CString(routes)

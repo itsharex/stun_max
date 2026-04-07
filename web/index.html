@@ -26,24 +26,65 @@
                 <span id="subtitle">Dashboard</span>
                 <span id="status-dot"></span>
                 <span id="status-text">Loading...</span>
+                <span id="last-refresh"></span>
                 <button id="logout-btn">Logout</button>
             </div>
             <div id="stats-bar">
                 <div class="stat-card"><div class="stat-value" id="room-count">0</div><div class="stat-label">Rooms</div></div>
                 <div class="stat-card"><div class="stat-value" id="peer-count">0</div><div class="stat-label">Peers</div></div>
-                <div class="stat-card"><div class="stat-value" id="direct-count">0</div><div class="stat-label" style="color:#00c853">⚡ P2P</div></div>
-                <div class="stat-card"><div class="stat-value" id="relay-count">0</div><div class="stat-label" style="color:#ff9800">🔄 Relay</div></div>
+                <div class="stat-card"><div class="stat-value" id="direct-count">0</div><div class="stat-label" style="color:#00c853">P2P</div></div>
+                <div class="stat-card"><div class="stat-value" id="relay-count">0</div><div class="stat-label" style="color:#ff9800">Relay</div></div>
+                <div class="stat-card"><div class="stat-value" id="uptime-value">-</div><div class="stat-label">Uptime</div></div>
+                <div class="stat-card"><div class="stat-value" id="bytes-relayed-value">0 B</div><div class="stat-label">Total Relayed</div></div>
+            </div>
+
+            <!-- Server Info -->
+            <div id="server-info-bar">
+                <div class="server-info-item">
+                    <span class="server-info-label">Active Connections</span>
+                    <span class="server-info-value" id="active-connections">0</span>
+                </div>
+                <div class="server-info-item">
+                    <span class="server-info-label">Server Uptime</span>
+                    <span class="server-info-value" id="server-uptime">-</span>
+                </div>
+            </div>
+
+            <!-- Tabs -->
+            <div id="tab-bar">
+                <button class="tab-btn tab-active" data-tab="rooms" onclick="app.switchTab('rooms')">Rooms</button>
+                <button class="tab-btn" data-tab="stun" onclick="app.switchTab('stun')">STUN Server</button>
+            </div>
+
+            <!-- Search (rooms tab) -->
+            <div id="search-bar" data-tab-content="rooms">
+                <input id="search-input" type="text" placeholder="Search rooms and peers..." />
+            </div>
+
+            <!-- STUN Server Tab -->
+            <div id="stun-tab" data-tab-content="stun" style="display:none">
+                <div id="stun-stats-bar">
+                    <div class="stat-card"><div class="stat-value" id="stun-requests">0</div><div class="stat-label">Requests</div></div>
+                    <div class="stat-card"><div class="stat-value" id="stun-clients">0</div><div class="stat-label">Unique IPs</div></div>
+                    <div class="stat-card"><div class="stat-value" id="stun-errors">0</div><div class="stat-label">Errors</div></div>
+                    <div class="stat-card"><div class="stat-value" id="stun-uptime">-</div><div class="stat-label">Uptime</div></div>
+                </div>
+                <div id="stun-clients-container">
+                    <h2>Recent STUN Clients</h2>
+                    <div id="stun-clients-list"></div>
+                    <div id="no-stun-clients" class="empty-state">No recent STUN clients</div>
+                </div>
             </div>
 
             <!-- Create Room -->
-            <div id="create-room-bar">
+            <div id="create-room-bar" data-tab-content="rooms">
                 <input id="new-room-name" placeholder="Room name" />
                 <input id="new-room-pass" type="password" placeholder="Password (optional)" />
                 <button id="create-room-btn">+ Create Room</button>
             </div>
 
             <!-- Rooms -->
-            <div id="rooms-container">
+            <div id="rooms-container" data-tab-content="rooms">
                 <h2>Active Rooms</h2>
                 <div id="rooms-list"></div>
                 <div id="no-rooms" class="empty-state">No active rooms</div>

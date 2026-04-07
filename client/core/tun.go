@@ -88,21 +88,60 @@ func deriveVirtualIP() string {
 	return fmt.Sprintf("10.7.0.%d", octet)
 }
 
-// getPrimaryMAC returns the MAC address of the first active non-loopback interface.
+// getPrimaryMAC returns the MAC address of the preferred network interface.
+// Priority: WiFi (wlan*) > physical NIC with broadcast > any.
+// On Android with both 5G and WiFi, always picks WiFi for stable machine ID.
 func getPrimaryMAC() net.HardwareAddr {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil
 	}
+
+	var wifiMAC, physMAC, anyMAC net.HardwareAddr
+
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
-		if len(iface.HardwareAddr) >= 6 {
-			return iface.HardwareAddr
+		if len(iface.HardwareAddr) < 6 {
+			continue
+		}
+
+		name := strings.ToLower(iface.Name)
+
+		// WiFi (highest priority — stable on Android)
+		if strings.HasPrefix(name, "wlan") {
+			if wifiMAC == nil {
+				wifiMAC = iface.HardwareAddr
+			}
+			continue
+		}
+
+		// Skip cellular and virtual interfaces
+		if strings.HasPrefix(name, "rmnet") || strings.HasPrefix(name, "ccmni") ||
+			strings.HasPrefix(name, "tun") || strings.HasPrefix(name, "utun") ||
+			strings.HasPrefix(name, "dummy") || strings.HasPrefix(name, "tap") {
+			continue
+		}
+
+		// Physical NIC (en0, eth0, etc.)
+		if iface.Flags&net.FlagBroadcast != 0 && physMAC == nil {
+			physMAC = iface.HardwareAddr
+			continue
+		}
+
+		if anyMAC == nil {
+			anyMAC = iface.HardwareAddr
 		}
 	}
-	return nil
+
+	if wifiMAC != nil {
+		return wifiMAC
+	}
+	if physMAC != nil {
+		return physMAC
+	}
+	return anyMAC
 }
 
 // extractHost extracts the hostname from a WebSocket URL (ws://host:port/path).
@@ -135,9 +174,9 @@ func (c *Client) StartTun(peerID string, routes []string, exitIP string) error {
 	}
 	c.tunMu.Unlock()
 
-	// Per-peer virtual IP
+	// Per-peer virtual IP (find next available index to avoid conflicts)
 	c.tunMu.RLock()
-	vpnIndex := len(c.tunDevices)
+	vpnIndex := c.nextVPNIndex()
 	c.tunMu.RUnlock()
 	myIP := allocVirtualIP(vpnIndex)
 	subnet := fmt.Sprintf("10.7.%d.0/24", vpnIndex)
@@ -224,6 +263,23 @@ func allocVirtualIP(index int) string {
 		return fmt.Sprintf("10.7.%d.100", index)
 	}
 	return fmt.Sprintf("10.7.%d.%d", index, ip[3])
+}
+
+// nextVPNIndex finds the next available VPN index that doesn't conflict
+// with existing tunnel devices.
+func (c *Client) nextVPNIndex() int {
+	used := map[int]bool{}
+	for _, dev := range c.tunDevices {
+		if dev.virtualIP != nil {
+			used[int(dev.virtualIP.To4()[2])] = true
+		}
+	}
+	for i := 0; i < 256; i++ {
+		if !used[i] {
+			return i
+		}
+	}
+	return len(c.tunDevices)
 }
 
 // addRoutesToExistingTun adds new subnets to an already-active VPN with the same peer.
@@ -340,8 +396,13 @@ func (c *Client) stopTunDevice(dev *TunDevice) {
 	removeTunInterface(dev.ifName)
 	removeServerRoute(dev.serverHost)
 
-	// On Android, stop the VpnService and reset pending config
-	stopPlatformVPN()
+	// On Android, only stop VpnService when no VPN sessions remain
+	c.tunMu.RLock()
+	remaining := len(c.tunDevices)
+	c.tunMu.RUnlock()
+	if remaining == 0 {
+		stopPlatformVPN()
+	}
 
 	c.emit(EventTunStopped, LogEvent{Level: "info", Message: "VPN stopped"})
 	c.ReportFeatures()
@@ -395,10 +456,22 @@ func (c *Client) handleTunSetup(msg Message) {
 			c.emit(EventLog, LogEvent{Level: "warn", Message: fmt.Sprintf("Rejected incoming VPN from %s: already have outgoing VPN (role: OUT)", shortID(msg.From))})
 			return
 		}
+		// Already have a working responder VPN — check if it's still alive
+		select {
+		case <-old.done:
+			// Old session is dead — replace it
+		default:
+			// Old session still alive — ignore duplicate setup (peer reconnect flapping)
+			c.tunMu.Unlock()
+			c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf("Ignoring duplicate VPN setup from %s (session still active)", shortID(msg.From))})
+			// Just re-send ack so the peer knows we're ready
+			c.sendRelay(msg.From, "tun_ack", TunAck{VirtualIP: old.virtualIP.String()})
+			return
+		}
 		// Same peer reconnecting as responder — tear down old session
 		delete(c.tunDevices, msg.From)
 		c.tunMu.Unlock()
-		c.emit(EventLog, LogEvent{Level: "info", Message: "Replacing stale VPN session"})
+		c.emit(EventLog, LogEvent{Level: "info", Message: "Replacing dead VPN session"})
 		old.closeOnce.Do(func() { close(old.done) })
 		if old.proxy != nil {
 			old.proxy.Close()
@@ -413,16 +486,26 @@ func (c *Client) handleTunSetup(msg Message) {
 		disableNAT(old.ifName)
 		removeTunInterface(old.ifName)
 		removeServerRoute(old.serverHost)
-		stopPlatformVPN() // Stop Android VpnService before creating new one
+		// Don't stopPlatformVPN here — other VPN sessions may still be active
 	} else {
 		c.tunMu.Unlock()
 	}
 
-	// B side: use own MAC-derived IP, peer's IP comes from setup.PeerIP
-	myIP := GetVirtualIP()
-	peerIP := setup.PeerIP
+	// B side: allocate a unique virtual IP per incoming VPN connection.
+	// Each connection gets its own 10.7.{N}.X subnet to avoid conflicts
+	// when multiple peers (A, C) connect to B simultaneously.
+	c.tunMu.RLock()
+	vpnIndex := c.nextVPNIndex()
+	c.tunMu.RUnlock()
 
-	// Collision check: if both sides derived the same IP, offset B by 1
+	myIP := allocVirtualIP(vpnIndex)
+	peerIP := setup.PeerIP
+	// Use the initiator's subnet if provided, otherwise generate one
+	if setup.Subnet == "" {
+		setup.Subnet = fmt.Sprintf("10.7.%d.0/24", vpnIndex)
+	}
+
+	// Collision check: if both sides derived the same IP, offset B
 	if myIP == peerIP {
 		ip := net.ParseIP(myIP).To4()
 		if ip != nil {
@@ -430,7 +513,7 @@ func (c *Client) handleTunSetup(msg Message) {
 			if next > 253 {
 				next = 2
 			}
-			myIP = fmt.Sprintf("10.7.0.%d", next)
+			myIP = fmt.Sprintf("10.7.%d.%d", vpnIndex, next)
 		}
 	}
 

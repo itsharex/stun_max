@@ -121,8 +121,16 @@ func (d *DashboardScreen) layoutTopBar(gtx layout.Context, th *material.Theme, a
 							}),
 							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 								return layout.Inset{Left: unit.Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-									room := material.Caption(th, "Room: "+a.RoomName)
-									room.Color = DimColor
+									roomText := "Room: " + a.RoomName
+									if a.Client != nil && a.Client.RelayDisabled() {
+										roomText += " [P2P Only]"
+									}
+									room := material.Caption(th, roomText)
+									if a.Client != nil && a.Client.RelayDisabled() {
+										room.Color = WarningColor
+									} else {
+										room.Color = DimColor
+									}
 									return room.Layout(gtx)
 								})
 							}),

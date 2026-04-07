@@ -28,7 +28,7 @@ func detectPhysicalIP() net.IP {
 		return nil
 	}
 
-	// TUN/virtual interface name patterns to skip
+	// TUN/virtual/cellular interface name patterns to skip
 	skipPrefixes := []string{
 		"utun", "tun", "tap",          // macOS/Linux TUN
 		"lo",                           // loopback
@@ -38,28 +38,26 @@ func detectPhysicalIP() net.IP {
 		"tailscale", "ts",             // Tailscale
 		"clash", "meta",               // Clash
 		"wintun",                      // Windows WinTUN (V2Ray/Clash)
+		"rmnet", "ccmni", "dummy",     // Android cellular/dummy
 	}
 
 	type candidate struct {
-		ip    net.IP
-		name  string
-		flags net.Flags
+		ip     net.IP
+		name   string
+		flags  net.Flags
+		isWifi bool
 	}
 
 	var candidates []candidate
 
 	for _, iface := range ifaces {
-		// Skip down interfaces
-		if iface.Flags&net.FlagUp == 0 {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if iface.Flags&net.FlagPointToPoint != 0 {
 			continue
 		}
 
-		// Skip loopback
-		if iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-
-		// Skip virtual/TUN interfaces by name
 		nameLower := strings.ToLower(iface.Name)
 		skip := false
 		for _, prefix := range skipPrefixes {
@@ -72,10 +70,7 @@ func detectPhysicalIP() net.IP {
 			continue
 		}
 
-		// Skip point-to-point interfaces (usually TUN/VPN)
-		if iface.Flags&net.FlagPointToPoint != 0 {
-			continue
-		}
+		isWifi := strings.HasPrefix(nameLower, "wlan") || strings.HasPrefix(nameLower, "en0")
 
 		addrs, err := iface.Addrs()
 		if err != nil || len(addrs) == 0 {
@@ -88,26 +83,19 @@ func detectPhysicalIP() net.IP {
 				continue
 			}
 			ip := ipNet.IP.To4()
-			if ip == nil {
-				continue // skip IPv6
-			}
-			// Skip link-local and loopback
-			if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
 				continue
 			}
-			// Skip CGNAT range (198.18.0.0/15) — often used by proxy TUN
+			// Skip CGNAT range (198.18.0.0/15) — proxy TUN
 			if ip[0] == 198 && (ip[1] == 18 || ip[1] == 19) {
 				continue
 			}
-			// Skip 10.0.0.0/8 if no hardware address (likely virtual)
 			if ip[0] == 10 && len(iface.HardwareAddr) == 0 {
 				continue
 			}
 
 			candidates = append(candidates, candidate{
-				ip:    ip,
-				name:  iface.Name,
-				flags: iface.Flags,
+				ip: ip, name: iface.Name, flags: iface.Flags, isWifi: isWifi,
 			})
 		}
 	}
@@ -116,14 +104,17 @@ func detectPhysicalIP() net.IP {
 		return nil
 	}
 
-	// Prefer interfaces with broadcast flag (physical NICs)
+	// Priority: WiFi > physical NIC with broadcast > any
+	for _, c := range candidates {
+		if c.isWifi {
+			return c.ip
+		}
+	}
 	for _, c := range candidates {
 		if c.flags&net.FlagBroadcast != 0 {
 			return c.ip
 		}
 	}
-
-	// Fallback: first candidate
 	return candidates[0].ip
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,9 +11,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -25,10 +29,14 @@ var upgrader = websocket.Upgrader{
 	EnableCompression: true,
 }
 
+const defaultPassword = "" // set via --web-password flag
+
 var (
-	hub          *Hub
-	relayManager *RelayManager
-	authToken    string
+	hub            *Hub
+	store          *Store
+	relayManager   *RelayManager
+	authToken      string
+	globalRelayOff int32 // atomic: 1 = relay globally disabled
 	sessions     sync.Map
 	activeConns  int64 // atomic: current WebSocket connections
 	maxConns     int64 = 5000
@@ -240,7 +248,7 @@ func apiRooms(w http.ResponseWriter, r *http.Request) {
 			h := sha256.Sum256([]byte(req.Password))
 			passHash = hex.EncodeToString(h[:])
 		}
-		hub.getOrCreateRoom(req.Name, passHash)
+		hub.getOrCreateRoom(req.Name, passHash, "", "") // dashboard-created = persistent
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"name": req.Name, "protected": req.Password != ""})
 	case http.MethodDelete:
@@ -278,6 +286,23 @@ func apiBan(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"ok": hub.banClient(req.Room, req.ClientID)})
 }
 
+func apiKick(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Room     string `json:"room"`
+		ClientID string `json:"client_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Room == "" || req.ClientID == "" {
+		http.Error(w, `{"error":"room and client_id required"}`, http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"ok": hub.kickClient(req.Room, req.ClientID)})
+}
+
 func apiUnban(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -307,52 +332,193 @@ func serveStatic(webDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) { fs.ServeHTTP(w, r) }
 }
 
+var stunStatsURL string
+
+func apiStunProxy(w http.ResponseWriter, r *http.Request) {
+	if stunStatsURL == "" {
+		http.Error(w, `{"error":"stun stats not configured"}`, http.StatusServiceUnavailable)
+		return
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(stunStatsURL + "/stats")
+	if err != nil {
+		http.Error(w, `{"error":"stun server unreachable"}`, http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	buf := make([]byte, 64*1024)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			w.Write(buf[:n])
+		}
+		if err != nil {
+			break
+		}
+	}
+}
+
+func apiRelayToggle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		// GET: return current state
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"global_relay_disabled": atomic.LoadInt32(&globalRelayOff) == 1,
+		})
+		return
+	}
+	var req struct {
+		Room     string `json:"room"`     // empty = global toggle
+		Disabled bool   `json:"disabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.Room == "" {
+		// Global toggle
+		if req.Disabled {
+			atomic.StoreInt32(&globalRelayOff, 1)
+			log.Printf("Relay globally DISABLED")
+		} else {
+			atomic.StoreInt32(&globalRelayOff, 0)
+			log.Printf("Relay globally ENABLED")
+		}
+	} else {
+		// Per-room toggle
+		hub.mu.RLock()
+		for _, room := range hub.rooms {
+			if room.Name == req.Room {
+				room.mu.Lock()
+				room.RelayDisabled = req.Disabled
+				room.mu.Unlock()
+				if req.Disabled {
+					log.Printf("Relay DISABLED for room %s", req.Room)
+				} else {
+					log.Printf("Relay ENABLED for room %s", req.Room)
+				}
+				// Notify clients in the room
+				notifyPayload, _ := json.Marshal(map[string]interface{}{
+					"relay_disabled": req.Disabled,
+				})
+				notifyMsg := Message{Type: "room_config", Payload: json.RawMessage(notifyPayload)}
+				data, _ := json.Marshal(notifyMsg)
+				room.broadcast(data, "")
+				break
+			}
+		}
+		hub.mu.RUnlock()
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+}
+
+func apiHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "ok",
+		"uptime":  time.Since(serverStartTime).Round(time.Second).String(),
+		"conns":   atomic.LoadInt64(&activeConns),
+	})
+}
+
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
-	webPass := flag.String("web-password", "", "dashboard password (empty=auto)")
+	webPass := flag.String("web-password", "", "dashboard password (empty=default)")
 	webDir := flag.String("web-dir", "../web", "web static files")
+	dbPath := flag.String("db", "stun_max.db", "SQLite database path")
 	maxC := flag.Int64("max-connections", 5000, "max WebSocket connections")
+	ipdbPath := flag.String("ipdb", "ip2region.xdb", "ip2region database file path")
+	stunHTTP := flag.String("stun-http", "http://127.0.0.1:3479", "STUN server stats URL (stunserver --http addr)")
 	tlsCert := flag.String("tls-cert", "", "TLS certificate file (enables HTTPS/WSS)")
 	tlsKey := flag.String("tls-key", "", "TLS private key file")
 	flag.Parse()
 
+	stunStatsURL = *stunHTTP
+
 	maxConns = *maxC
-	hub = newHub()
+
+	// Initialize SQLite store
+	var err error
+	store, err = newStore(*dbPath)
+	if err != nil {
+		log.Fatalf("Failed to open database: %v", err)
+	}
+	defer store.Close()
+
+	hub = newHub(store)
 	go hub.run()
 	relayManager = newRelayManager()
 
+	// Initialize offline IP geolocation database
+	initIPDB(*ipdbPath)
+
+	// Password: CLI flag > default
 	if *webPass != "" {
 		authToken = *webPass
+	} else if defaultPassword != "" {
+		authToken = defaultPassword
 	} else {
 		authToken = generateToken(16)
 	}
 
-	fmt.Println("═══════════════════════════════════════")
-	fmt.Println("  STUN Max Server")
 	proto := "HTTP"
 	if *tlsCert != "" && *tlsKey != "" {
 		proto = "HTTPS"
 	}
 
 	fmt.Println("═══════════════════════════════════════")
+	fmt.Println("  STUN Max Server")
+	fmt.Println("═══════════════════════════════════════")
 	fmt.Printf("  Listen:     %s (%s)\n", *addr, proto)
-	fmt.Printf("  Password:   %s\n", authToken)
+	fmt.Printf("  Database:   %s\n", *dbPath)
 	fmt.Printf("  Max Conns:  %d\n", maxConns)
 	fmt.Println("═══════════════════════════════════════")
 
-	http.HandleFunc("/ws", serveWs)
-	http.HandleFunc("/api/login", apiLogin)
-	http.HandleFunc("/api/rooms", requireAuth(apiRooms))
-	http.HandleFunc("/api/rooms/ban", requireAuth(apiBan))
-	http.HandleFunc("/api/rooms/unban", requireAuth(apiUnban))
-	http.HandleFunc("/api/auth", requireAuth(apiAuthCheck))
-	http.HandleFunc("/api/stats", requireAuth(apiStats))
-	http.HandleFunc("/", serveStatic(*webDir))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", serveWs)
+	mux.HandleFunc("/health", apiHealth)
+	mux.HandleFunc("/api/login", apiLogin)
+	mux.HandleFunc("/api/rooms", requireAuth(apiRooms))
+	mux.HandleFunc("/api/rooms/kick", requireAuth(apiKick))
+	mux.HandleFunc("/api/relay", requireAuth(apiRelayToggle))
+	mux.HandleFunc("/api/rooms/ban", requireAuth(apiBan))
+	mux.HandleFunc("/api/rooms/unban", requireAuth(apiUnban))
+	mux.HandleFunc("/api/auth", requireAuth(apiAuthCheck))
+	mux.HandleFunc("/api/stats", requireAuth(apiStats))
+	mux.HandleFunc("/api/stun", requireAuth(apiStunProxy))
+	mux.HandleFunc("/", serveStatic(*webDir))
+
+	server := &http.Server{
+		Addr:    *addr,
+		Handler: mux,
+	}
+
+	// Graceful shutdown
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		log.Println("Shutting down gracefully...")
+		hub.syncBytesToStore()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		server.Shutdown(ctx)
+	}()
 
 	log.Printf("Server starting on %s (%s)", *addr, proto)
 	if *tlsCert != "" && *tlsKey != "" {
-		log.Fatal(http.ListenAndServeTLS(*addr, *tlsCert, *tlsKey, nil))
+		if err := server.ListenAndServeTLS(*tlsCert, *tlsKey); err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
 	} else {
-		log.Fatal(http.ListenAndServe(*addr, nil))
+		if err := server.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
 	}
+	log.Println("Server stopped")
 }

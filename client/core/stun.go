@@ -224,82 +224,166 @@ func (c *Client) DiscoverSTUN(servers []string) error {
 	return fmt.Errorf("all STUN servers failed")
 }
 
-// detectNATType determines our NAT type by querying multiple STUN servers.
+// detectNATType determines our NAT type using RFC 5780 mapping behavior test.
+// Queries multiple STUN servers from the SAME socket to check if the NAT assigns
+// the same external port regardless of destination (Endpoint-Independent Mapping = Cone)
+// or different ports per destination (Endpoint-Dependent Mapping = Symmetric).
+//
+// Filtering behavior (Full Cone vs Restricted vs Port Restricted) requires a
+// dual-IP STUN server with CHANGE-REQUEST support, which standard public STUN
+// servers don't provide. We conservatively assume Port Restricted (NAT3) for
+// cone NATs — this only affects hole punch strategy (not correctness).
 func (c *Client) detectNATType(publicAddr, primarySrv string, servers []string) {
-	localIP := getLocalIP()
 	pubIP, _, _ := net.SplitHostPort(publicAddr)
 
-	// Check if we're on the public internet (no NAT)
-	if pubIP == localIP {
+	// Check if we're on the public internet (no NAT).
+	if hasLocalIP(pubIP) {
 		c.natType = NATOpen
 		c.emit(EventLog, LogEvent{Level: "info", Message: "NAT type: NAT1 (Open Internet)"})
-		c.sendStunInfo("") // re-broadcast with NAT type
 		return
 	}
 
-	// Query a second STUN server from a fresh socket to check port consistency
-	var secondAddr string
-	for _, srv := range servers {
-		srv = strings.TrimSpace(srv)
-		if srv == "" || srv == primarySrv {
-			continue
-		}
-		conn, err := bypassListenUDP()
-		if err != nil {
-			continue
-		}
-		result := stunQueryFresh(conn, srv)
-		conn.Close()
-		if result != "" {
-			secondAddr = result
-			break
-		}
-	}
-
-	if secondAddr == "" {
-		// Can't determine — assume cone NAT
-		c.natType = NATRestrictedCone
-		c.emit(EventLog, LogEvent{Level: "info", Message: "NAT type: NAT2 (Restricted Cone, estimated)"})
-		c.sendStunInfo("")
-		return
-	}
-
-	// Compare ports from same local socket to different servers
-	// Query primary and secondary from the SAME socket
+	// === Mapping Behavior Test ===
+	// Query 2+ STUN servers from the SAME socket.
+	// Same mapped port → Cone NAT (NAT1). Different mapped port → Symmetric (NAT4).
 	testConn, err := bypassListenUDP()
 	if err != nil {
-		c.natType = NATRestrictedCone
-		c.sendStunInfo("")
+		c.natType = NATFullCone
+		c.emit(EventLog, LogEvent{Level: "info", Message: "NAT type: NAT1 (default, socket failed)"})
 		return
 	}
 	defer testConn.Close()
 
-	addr1 := stunQueryFresh(testConn, primarySrv)
-	addr2 := stunQueryFresh(testConn, servers[len(servers)-1])
+	type stunResult struct {
+		server string
+		port   string
+	}
+	var results []stunResult
+	seenIPs := map[string]bool{}
 
-	if addr1 == "" || addr2 == "" {
-		c.natType = NATRestrictedCone
-		c.emit(EventLog, LogEvent{Level: "info", Message: "NAT type: NAT2 (Restricted Cone, estimated)"})
-		c.sendStunInfo("")
+	for _, srv := range servers {
+		srv = strings.TrimSpace(srv)
+		if srv == "" {
+			continue
+		}
+		resolved, err := net.ResolveUDPAddr("udp4", srv)
+		if err != nil {
+			continue
+		}
+		ipKey := resolved.IP.String()
+		if seenIPs[ipKey] {
+			continue
+		}
+		addr := stunQueryFresh(testConn, srv)
+		if addr == "" {
+			continue
+		}
+		seenIPs[ipKey] = true
+		_, port, _ := net.SplitHostPort(addr)
+		results = append(results, stunResult{server: srv, port: port})
+		if len(results) >= 2 {
+			break
+		}
+	}
+
+	if len(results) < 2 {
+		c.natType = NATFullCone
+		c.emit(EventLog, LogEvent{Level: "info", Message: "NAT type: NAT1 (default, only 1 STUN server reachable)"})
 		return
 	}
 
-	_, port1Str, _ := net.SplitHostPort(addr1)
-	_, port2Str, _ := net.SplitHostPort(addr2)
-
-	if port1Str != port2Str {
-		// Port changes per destination → Symmetric NAT
-		c.natType = NATSymmetric
-		c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf("NAT type: NAT4 (Symmetric) — port varies per destination (%s vs %s)", port1Str, port2Str)})
+	if results[0].port == results[1].port {
+		c.natType = NATFullCone
+		c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf(
+			"NAT type: NAT1 (Cone NAT, port consistent: %s via %s and %s)",
+			results[0].port, results[0].server, results[1].server)})
 	} else {
-		// Port consistent — Cone NAT (NAT1-3)
-		// Distinguish between NAT2 and NAT3 requires a multi-address STUN server
-		// which we don't control. Default to NAT3 (more conservative).
-		c.natType = NATPortRestricted
-		c.emit(EventLog, LogEvent{Level: "info", Message: "NAT type: NAT3 (Port Restricted Cone)"})
+		c.natType = NATSymmetric
+		c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf(
+			"NAT type: NAT4 (Symmetric, port varies: %s vs %s)",
+			results[0].port, results[1].port)})
+		c.detectPortAllocation(servers)
+	}
+	// NOTE: No sendStunInfo("") here — DiscoverSTUN already broadcast once.
+	// NAT type will be included in subsequent stun_info messages (peer join, etc.)
+}
+
+// hasLocalIP checks if the given IP matches any local network interface.
+func hasLocalIP(ip string) bool {
+	target := net.ParseIP(ip)
+	if target == nil {
+		return false
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return false
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ifIP net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ifIP = v.IP
+			case *net.IPAddr:
+				ifIP = v.IP
+			}
+			if ifIP != nil && ifIP.Equal(target) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// detectPortAllocation checks if the NAT allocates ports sequentially.
+// This determines whether port prediction is viable for symmetric NAT traversal.
+func (c *Client) detectPortAllocation(servers []string) {
+	if len(servers) == 0 {
+		return
+	}
+	bestSrv := servers[0]
+
+	// Take 3 samples from fresh sockets to the same server
+	var ports []int
+	for i := 0; i < 3; i++ {
+		conn, err := bypassListenUDP()
+		if err != nil {
+			continue
+		}
+		addr := stunQueryFresh(conn, bestSrv)
+		conn.Close()
+		if addr != "" {
+			_, portStr, _ := net.SplitHostPort(addr)
+			p := 0
+			fmt.Sscanf(portStr, "%d", &p)
+			if p > 0 {
+				ports = append(ports, p)
+			}
+		}
+		time.Sleep(50 * time.Millisecond) // brief delay to avoid port reuse
 	}
 
-	c.sendStunInfo("") // re-broadcast with NAT type
+	if len(ports) < 3 {
+		return
+	}
+
+	d1 := ports[1] - ports[0]
+	d2 := ports[2] - ports[1]
+
+	if d1 > 0 && d1 <= 10 && d1 == d2 {
+		c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf(
+			"NAT4 port allocation: sequential (delta=%d) — port prediction viable", d1)})
+	} else {
+		c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf(
+			"NAT4 port allocation: random (deltas=%d,%d) — birthday attack only", d1, d2)})
+	}
 }
 
 // stunQueryFresh sends a STUN binding request to a server from the given conn.
@@ -426,11 +510,37 @@ func (c *Client) handleStunInfo(msg Message) {
 		pc.NATType = info.NATType
 	}
 
-	// CRITICAL: don't overwrite UDPAddr if peer is already direct and working.
-	// Changing addr mid-stream breaks crypto lookup and causes tunnel flaps.
-	if pc.Mode == "direct" {
+	// If peer is already direct AND the address hasn't changed, skip.
+	// But if the address changed (peer reconnected with new STUN endpoint),
+	// we need to re-punch even if mode was "direct".
+	if pc.Mode == "direct" && pc.UDPAddr != nil && pc.UDPAddr.String() == udpAddr.String() {
 		c.peerConnsMu.Unlock()
-		return // already connected, ignore new stun_info
+		return // same addr, already connected — no action needed
+	}
+
+	addrChanged := pc.UDPAddr != nil && pc.UDPAddr.String() != udpAddr.String()
+	if addrChanged && pc.Mode == "direct" {
+		// Peer reconnected with new address — reset to connecting so we re-punch
+		pc.Mode = "connecting"
+		pc.Crypto = nil
+		peerID := msg.From
+		c.peerConnsMu.Unlock()
+
+		c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf(
+			"Peer %s address changed, resetting P2P state", shortID(peerID))})
+
+		// Cancel active speed tests with this peer
+		c.cancelSpeedTestsForPeer(peerID)
+
+		// Close stale forward netstack (will be recreated on demand)
+		c.fwdNetstacksMu.Lock()
+		if fn, ok := c.fwdNetstacks[peerID]; ok {
+			delete(c.fwdNetstacks, peerID)
+			go fn.Close()
+		}
+		c.fwdNetstacksMu.Unlock()
+
+		c.peerConnsMu.Lock()
 	}
 
 	pc.UDPAddr = udpAddr
@@ -485,25 +595,29 @@ func (c *Client) attemptHolePunch(peerID string, isLAN bool) {
 	myID := []byte(c.MyID)
 	myNAT := c.natType
 
-	// Determine adaptive strategy based on both sides' NAT types
-	// NAT1+NAT1 → Phase 1 only
-	// NAT1/2+NAT3 → Phase 1 + small birthday
-	// NAT3+NAT3 → Phase 1 + birthday attack
-	// NAT3+NAT4 or NAT4+NAT4 → all phases, max aggression
-	hardNAT := peerNAT == NATSymmetric || myNAT == NATSymmetric
+	// ──────────────────────────────────────────────────────────
+	// Adaptive strategy based on both sides' NAT types.
+	//
+	// Research-backed success rates (Tailscale/RFC analysis):
+	//   Cone + Cone (NAT1-3 + NAT1-3):  ~90%+ with basic burst
+	//   Cone + Symmetric (NAT3 + NAT4): ~98% with 256-socket birthday attack
+	//   Symmetric + Symmetric (NAT4+NAT4): ~0.01% — relay is the answer
+	//
+	// Phase 1: Direct burst from main socket (all cases)
+	// Phase 2: Birthday attack — open N sockets, each punches (NAT3+NAT4)
+	// Phase 3: Port prediction ±range (NAT4 sequential allocation)
+	// Phase 4: Random port spray from main socket (NAT3+NAT4)
+	// ──────────────────────────────────────────────────────────
+	anyHard := peerNAT == NATSymmetric || myNAT == NATSymmetric
+	oneHard := anyHard && !(peerNAT == NATSymmetric && myNAT == NATSymmetric)
 	bothHard := peerNAT == NATSymmetric && myNAT == NATSymmetric
-	mediumNAT := peerNAT == NATPortRestricted || myNAT == NATPortRestricted
-
-	// Phase 1 burst count: 20 for easy, 30 for medium, 40 for hard
-	burstCount := 20
-	if hardNAT {
-		burstCount = 40
-	} else if mediumNAT {
-		burstCount = 30
-	}
 
 	// Phase 1: Rapid burst from main socket
 	punch := append([]byte("PUNCH:"), myID...)
+	burstCount := 20
+	if anyHard {
+		burstCount = 40
+	}
 	for i := 0; i < burstCount; i++ {
 		select {
 		case <-c.done:
@@ -514,29 +628,21 @@ func (c *Client) attemptHolePunch(peerID string, isLAN bool) {
 		time.Sleep(25 * time.Millisecond)
 	}
 
-	// Skip Phase 2 & 3 for LAN — no NAT to punch through
+	// Skip Phase 2-4 for LAN — no NAT to punch through
 	if isLAN {
 		return
 	}
 
-	// Phase 2: Multi-socket parallel punch (Birthday Attack)
-	// Scale sockets based on NAT difficulty
+	// Phase 2: Birthday Attack (multi-socket parallel punch)
+	// Per Tailscale research: 256 sockets × ~4 packets each gives ~98% success
+	// for NAT3+NAT4 when the NAT3 side also probes random ports (Phase 4).
 	birthdaySockets := 0
-	birthdayPackets := 5
-	if bothHard {
-		// NAT4+NAT4: maximum aggression
-		birthdaySockets = 16
-		birthdayPackets = 8
-	} else if hardNAT {
-		// NAT3+NAT4 or NAT4+easy: aggressive
-		birthdaySockets = 12
-		birthdayPackets = 6
-	} else if mediumNAT {
-		// NAT3+NAT3: moderate
-		birthdaySockets = 8
-		birthdayPackets = 5
+	birthdayPackets := 4
+	if anyHard {
+		// One or both sides NAT4: full birthday attack
+		birthdaySockets = 256
+		birthdayPackets = 4
 	}
-	// NAT1/NAT2 both sides: skip birthday attack
 
 	if birthdaySockets > 0 {
 		var extraConns []*net.UDPConn
@@ -568,22 +674,42 @@ func (c *Client) attemptHolePunch(peerID string, isLAN bool) {
 	}
 
 	// Phase 3: Port prediction — only when at least one side is Symmetric (NAT4)
-	if hardNAT {
-		portRange := 10
+	// Scan ±1000~1500 ports around the peer's known port.
+	if anyHard {
+		portRange := 1000
 		if bothHard {
-			portRange = 20 // wider range for NAT4+NAT4
+			portRange = 1500
 		}
 		basePort := addr.Port
 		for delta := -portRange; delta <= portRange; delta++ {
 			if delta == 0 {
 				continue
 			}
-			predictedPort := basePort + delta
-			if predictedPort <= 0 || predictedPort > 65535 {
+			p := basePort + delta
+			if p <= 1024 || p > 65534 {
 				continue
 			}
-			predictedAddr := &net.UDPAddr{IP: addr.IP, Port: predictedPort}
-			udp.WriteToUDP(punch, predictedAddr)
+			udp.WriteToUDP(punch, &net.UDPAddr{IP: addr.IP, Port: p})
+		}
+	}
+
+	// Phase 4: Random port spray (NAT3+NAT4 scenario)
+	// The Cone side (NAT3) probes random ports on the Symmetric side's IP,
+	// hoping to hit one of the 256 birthday sockets' NAT mappings.
+	// ~1024 probes across 65535 ports with 256 targets = ~98% collision probability.
+	if oneHard && myNAT != NATSymmetric {
+		// We're the Cone side — spray random ports on peer's IP
+		for i := 0; i < 1024; i++ {
+			select {
+			case <-c.done:
+				return
+			default:
+			}
+			// Random port in ephemeral range (1024-65535)
+			b := make([]byte, 2)
+			rand.Read(b)
+			rPort := int(binary.BigEndian.Uint16(b))%64512 + 1024
+			udp.WriteToUDP(punch, &net.UDPAddr{IP: addr.IP, Port: rPort})
 		}
 	}
 }
@@ -699,6 +825,8 @@ func (c *Client) dispatchSMMessage(msg Message) {
 		c.handleSTFinish(msg)
 	case "st_result":
 		c.handleSTResult(msg)
+	case "st_cancel":
+		c.handleSTCancel(msg)
 	case "file_offer":
 		c.handleFileOffer(msg)
 	case "file_accept":

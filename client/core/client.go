@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -86,12 +87,27 @@ type Client struct {
 	// Auto-hop relay permission
 	allowHopRelay bool // default true — allow peers to route through our P2P connections
 
+	// Server relay status
+	relayDisabled bool // true if server disabled relay for this room
+
 	// Peer leave debounce: delay "peer left" to handle brief disconnects
 	pendingLeaves   map[string]*time.Timer // name → cancel timer
 	pendingLeavesMu sync.Mutex
 
+	// VPN auto-restore: when a VPN peer disconnects, save config for auto-restart
+	vpnRestoreConfigs   map[string]*vpnRestoreConfig // peerName → config
+	vpnRestoreMu        sync.Mutex
+
 	done chan struct{}
 	wg   sync.WaitGroup
+}
+
+// vpnRestoreConfig saves VPN parameters for auto-restart when peer reconnects.
+type vpnRestoreConfig struct {
+	PeerName string
+	Routes   []string
+	ExitIP   string
+	Role     string // "initiator" or "responder"
 }
 
 // NewClient creates a new Client from the given config.
@@ -120,7 +136,8 @@ func NewClient(cfg ClientConfig) *Client {
 		fileTransfers: make(map[string]*activeFileTransfer),
 		hops:              make(map[string]*HopBridge),
 		hopBridgeByTunnel: make(map[string]*HopBridge),
-		pendingLeaves: make(map[string]*time.Timer),
+		pendingLeaves:     make(map[string]*time.Timer),
+		vpnRestoreConfigs: make(map[string]*vpnRestoreConfig),
 		fwdNetstacks:  make(map[string]*forwardNetstack),
 		tunDevices:    make(map[string]*TunDevice),
 		tunAckChs:     make(map[string]chan string),
@@ -454,10 +471,11 @@ func (c *Client) Forwards() []ForwardInfo {
 // StunStatus returns a snapshot of STUN/P2P state.
 func (c *Client) StunStatus() StunInfo {
 	info := StunInfo{
-		PublicAddr: c.publicAddr,
-		Enabled:    c.publicAddr != "",
-		NATType:    c.natType,
-		PeerConns:  make(map[string]string),
+		PublicAddr:    c.publicAddr,
+		Enabled:       c.publicAddr != "",
+		NATType:       c.natType,
+		RelayDisabled: c.relayDisabled,
+		PeerConns:     make(map[string]string),
 	}
 	c.peerConnsMu.RLock()
 	for id, pc := range c.peerConns {
@@ -731,14 +749,18 @@ func (c *Client) reconnect() bool {
 		default:
 		}
 
-		c.emit(EventReconnecting, LogEvent{Level: "info", Message: fmt.Sprintf("Reconnect attempt %d...", attempt)})
+		// Backoff: 1s, 2s, 3s, 5s, 5s, 5s... (cap at 5s)
+		delay := time.Duration(attempt) * time.Second
+		if delay > 5*time.Second {
+			delay = 5 * time.Second
+		}
 
-		time.Sleep(3 * time.Second)
+		c.emit(EventReconnecting, LogEvent{Level: "info", Message: fmt.Sprintf("Reconnect attempt %d (in %s)...", attempt, delay)})
 
 		select {
+		case <-time.After(delay):
 		case <-c.done:
 			return false
-		default:
 		}
 
 		// Use saved config for connection parameters
@@ -754,8 +776,11 @@ func (c *Client) reconnect() bool {
 		passHash := c.passwordHash
 		name := c.name
 
-		// Try to connect
-		dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+		// Try to connect (with proxy bypass)
+		dialer := websocket.Dialer{
+			HandshakeTimeout: 10 * time.Second,
+			NetDialContext:   bypassDialer(10 * time.Second).DialContext,
+		}
 		conn, _, err := dialer.Dial(serverURL, nil)
 		if err != nil {
 			c.emit(EventLog, LogEvent{Level: "warn", Message: fmt.Sprintf("Reconnect failed: %v", err)})
@@ -853,19 +878,70 @@ func (c *Client) resetP2PState() {
 	c.p2pMapsMu.Unlock()
 }
 
-// generateMachineID creates a deterministic client ID from MAC address + name.
-// Same machine + same name = same ID across restarts and reconnects.
+// generateMachineID creates a deterministic client ID from stable device identity.
+// Uses WiFi MAC (stable) on desktop, hostname on Android (where MAC is randomized).
+// Same machine + same name = same ID across restarts, reconnects, and network switches.
 func generateMachineID(name string) string {
-	mac := getPrimaryMAC()
 	var seed string
-	if mac != nil {
-		seed = mac.String() + ":" + name
-	} else {
+
+	// On Android, MAC addresses are randomized per-connection (Android 10+),
+	// and multiple interfaces (WiFi + cellular) produce different MACs.
+	// Use hostname as the stable seed instead.
+	if isAndroid() {
 		h, _ := os.Hostname()
-		seed = h + ":" + name
+		seed = "android:" + h + ":" + name
+	} else {
+		mac := getPrimaryMAC()
+		if mac != nil {
+			seed = mac.String() + ":" + name
+		} else {
+			h, _ := os.Hostname()
+			seed = h + ":" + name
+		}
 	}
+
 	hash := sha256.Sum256([]byte(seed))
 	return hex.EncodeToString(hash[:8]) // 16-char hex ID
+}
+
+// isAndroid detects if running on Android.
+func isAndroid() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	// Multiple detection methods — build.prop may not be readable without root
+	checks := []string{
+		"/system/bin/app_process",     // Android app runtime
+		"/system/bin/app_process64",   // Android 64-bit
+		"/data/dalvik-cache",          // Dalvik/ART cache
+		"/system/framework/framework.jar", // Android framework
+	}
+	for _, path := range checks {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) handleRoomConfig(msg Message) {
+	var cfg struct {
+		RelayDisabled bool `json:"relay_disabled"`
+	}
+	if err := json.Unmarshal(msg.Payload, &cfg); err != nil {
+		return
+	}
+	c.relayDisabled = cfg.RelayDisabled
+	if cfg.RelayDisabled {
+		c.emit(EventLog, LogEvent{Level: "warn", Message: "Room config: relay disabled (P2P only)"})
+	} else {
+		c.emit(EventLog, LogEvent{Level: "info", Message: "Room config: relay enabled"})
+	}
+}
+
+// RelayDisabled returns whether the server has disabled relay for the current room.
+func (c *Client) RelayDisabled() bool {
+	return c.relayDisabled
 }
 
 func splitMessages(data []byte) [][]byte {
@@ -887,6 +963,8 @@ func (c *Client) handleMessage(msg Message) {
 		c.handleRelayData(msg)
 	case "stun_info":
 		c.handleStunInfo(msg)
+	case "room_config":
+		c.handleRoomConfig(msg)
 	case "error":
 		var errInfo struct {
 			Error string `json:"error"`
@@ -956,6 +1034,32 @@ func (c *Client) handlePeerList(msg Message) {
 			if c.publicAddr != "" {
 				c.sendStunInfo(p.ID)
 			}
+
+			// Check if we have a saved VPN config for this peer — auto-restore
+			peerDisplayName := p.Name
+			if peerDisplayName == "" {
+				peerDisplayName = shortID(p.ID)
+			}
+			c.vpnRestoreMu.Lock()
+			restoreCfg, hasRestore := c.vpnRestoreConfigs[peerDisplayName]
+			if hasRestore {
+				delete(c.vpnRestoreConfigs, peerDisplayName)
+			}
+			c.vpnRestoreMu.Unlock()
+
+			if hasRestore && restoreCfg.Role == "initiator" {
+				peerID := p.ID
+				routes := restoreCfg.Routes
+				exitIP := restoreCfg.ExitIP
+				// Delay to let P2P establish first
+				go func() {
+					time.Sleep(5 * time.Second)
+					c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf("Auto-restoring VPN to %s (routes: %v)", peerDisplayName, routes)})
+					if err := c.StartTun(peerID, routes, exitIP); err != nil {
+						c.emit(EventLog, LogEvent{Level: "warn", Message: fmt.Sprintf("VPN auto-restore failed: %v", err)})
+					}
+				}()
+			}
 		}
 	}
 
@@ -1018,13 +1122,16 @@ func (c *Client) handlePeerList(msg Message) {
 						c.tunMu.Unlock()
 					}
 
-					// Migrate forwarding netstacks
+					// Close stale forward netstacks (will be recreated on demand)
 					c.fwdNetstacksMu.Lock()
 					if ns, ok := c.fwdNetstacks[oldID]; ok {
 						delete(c.fwdNetstacks, oldID)
-						c.fwdNetstacks[newID] = ns
+						go ns.Close()
 					}
 					c.fwdNetstacksMu.Unlock()
+
+					// Cancel speed tests with old peer ID
+					c.cancelSpeedTestsForPeer(oldID)
 
 					c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf("Peer %s reconnected: cleaned old state, new ID %s", p.Name, shortID(newID))})
 					continue
@@ -1073,11 +1180,25 @@ func (c *Client) handlePeerList(msg Message) {
 					// Clean up P2P maps and auto-hop routes involving this peer
 					c.cleanupPeerP2PMap(peerCopy.ID)
 
-					// Clean up VPN if this peer was our VPN partner
+					// Clean up VPN if this peer was our VPN partner — save config for auto-restore
 					c.tunMu.Lock()
 					if dev, ok := c.tunDevices[peerCopy.ID]; ok {
 						delete(c.tunDevices, peerCopy.ID)
 						c.tunMu.Unlock()
+
+						// Save VPN config for auto-restore when peer comes back
+						if dev.role == "initiator" {
+							c.vpnRestoreMu.Lock()
+							c.vpnRestoreConfigs[displayName] = &vpnRestoreConfig{
+								PeerName: displayName,
+								Routes:   dev.routes,
+								ExitIP:   func() string { if dev.exitIP != nil { return dev.exitIP.String() }; return "" }(),
+								Role:     dev.role,
+							}
+							c.vpnRestoreMu.Unlock()
+							c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf("VPN config saved for auto-restore when %s reconnects", displayName)})
+						}
+
 						dev.closeOnce.Do(func() { close(dev.done) })
 						if dev.nsProxy != nil {
 							dev.nsProxy.Close()
@@ -1094,7 +1215,8 @@ func (c *Client) handlePeerList(msg Message) {
 						cleanupSNATRoute(dev.ifName, dev.snatIP)
 						disableNAT(dev.ifName)
 						removeTunInterface(dev.ifName)
-						c.emit(EventTunStopped, LogEvent{Level: "info", Message: fmt.Sprintf("VPN stopped: peer %s disconnected", displayName)})
+						stopPlatformVPN()
+						c.emit(EventTunStopped, LogEvent{Level: "info", Message: fmt.Sprintf("VPN stopped: peer %s disconnected (will auto-restore)", displayName)})
 					} else {
 						c.tunMu.Unlock()
 					}

@@ -11,249 +11,309 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 )
 
-// STUN constants (RFC 5389)
+// ════════════════════════════════════════════════════════════════
+// STUN 协议常量 (RFC 5389 / RFC 5780)
+// ════════════════════════════════════════════════════════════════
+
 const (
 	stunMagicCookie    uint32 = 0x2112A442
 	stunBindingRequest uint16 = 0x0001
-	stunAttrXorMapped  uint16 = 0x0020
-	stunAttrMapped     uint16 = 0x0001
-	stunAttrChangedAddr uint16 = 0x0005
-	stunAttrOtherAddr  uint16 = 0x802C
+	stunBindingResponse uint16 = 0x0101
+	stunAttrMapped     uint16 = 0x0001 // MAPPED-ADDRESS
+	stunAttrChangeReq  uint16 = 0x0003 // CHANGE-REQUEST (RFC 5780)
+	stunAttrChangedAddr uint16 = 0x0005 // CHANGED-ADDRESS (RFC 3489 legacy)
+	stunAttrXorMapped  uint16 = 0x0020 // XOR-MAPPED-ADDRESS
+	stunAttrRespOrigin uint16 = 0x802B // RESPONSE-ORIGIN (RFC 5780)
+	stunAttrOtherAddr  uint16 = 0x802C // OTHER-ADDRESS (RFC 5780)
 	stunHeaderSize            = 20
 	stunTimeout               = 3 * time.Second
 )
 
-// ANSI escape sequences
+// CHANGE-REQUEST 标志位
 const (
-	reset     = "\033[0m"
-	bold      = "\033[1m"
-	dim       = "\033[2m"
-	italic    = "\033[3m"
-	underline = "\033[4m"
-	red       = "\033[31m"
-	green     = "\033[32m"
-	yellow    = "\033[33m"
-	blue      = "\033[34m"
-	magenta   = "\033[35m"
-	cyan      = "\033[36m"
-	white     = "\033[97m"
-	gray      = "\033[90m"
-	bgRed     = "\033[41m"
-	bgGreen   = "\033[42m"
-	bgYellow  = "\033[43m"
-	bgBlue    = "\033[44m"
-	bgCyan    = "\033[46m"
+	changeIP   uint32 = 0x04 // bit 29
+	changePort uint32 = 0x02 // bit 30
 )
 
-// NAT types (RFC 3489 + extended)
+// ANSI 颜色
 const (
-	NATOpen              = "Open Internet"
-	NATFullCone          = "Full Cone NAT"
-	NATRestrictedCone    = "Restricted Cone NAT"
-	NATPortRestricted    = "Port Restricted Cone NAT"
-	NATSymmetric         = "Symmetric NAT"
-	NATSymmetricFirewall = "Symmetric UDP Firewall"
-	NATBlocked           = "UDP Blocked"
+	reset  = "\033[0m"
+	bold   = "\033[1m"
+	dim    = "\033[2m"
+	red    = "\033[31m"
+	green  = "\033[32m"
+	yellow = "\033[33m"
+	blue   = "\033[34m"
+	cyan   = "\033[36m"
+	white  = "\033[97m"
+	gray   = "\033[90m"
 )
 
-// STUNResult holds the result of a single STUN query
+// ════════════════════════════════════════════════════════════════
+// NAT 类型定义
+// ════════════════════════════════════════════════════════════════
+
+// 映射行为 (Mapping Behavior)
+const (
+	MapEndpointIndep = "端点无关映射"       // EIM: 同一源→任意目标，外部端口不变
+	MapAddrDep       = "地址相关映射"       // ADM: 不同目标IP→不同外部端口
+	MapAddrPortDep   = "地址+端口相关映射"   // APDM: 不同目标IP:Port→不同外部端口 (Symmetric)
+)
+
+// 过滤行为 (Filtering Behavior)
+const (
+	FilterEndpointIndep = "端点无关过滤" // EIF: 任意外部主机可发包进来
+	FilterAddrDep       = "地址相关过滤" // ADF: 只有已联系过的IP可发包
+	FilterAddrPortDep   = "地址+端口相关过滤" // APDF: 只有已联系过的IP:Port可发包
+	FilterUnknown       = "未知(需要RFC5780服务器)"
+)
+
+// 经典 NAT 类型
+const (
+	NATOpen            = "开放网络 (NAT0)"
+	NATFullCone        = "完全锥形 (NAT1)"
+	NATRestrictedCone  = "受限锥形 (NAT2)"
+	NATPortRestricted  = "端口受限锥形 (NAT3)"
+	NATSymmetric       = "对称型 (NAT4)"
+	NATSymFirewall     = "对称型防火墙"
+	NATBlocked         = "UDP 被阻断"
+)
+
+// ════════════════════════════════════════════════════════════════
+// 数据结构
+// ════════════════════════════════════════════════════════════════
+
 type STUNResult struct {
 	Server     string
 	PublicAddr string
 	PublicIP   string
 	PublicPort int
-	LocalPort  int
 	Latency    time.Duration
+	OtherAddr  string // OTHER-ADDRESS from RFC 5780 server
 	Error      error
 }
 
-// PortAllocInfo describes port allocation behavior
 type PortAllocInfo struct {
-	Pattern    string // "port-preserving", "sequential", "random"
-	Delta      int    // average delta for sequential
-	Ports      []int  // observed public ports
-	LocalPorts []int  // corresponding local ports
-	Predictable bool
+	Pattern string // "保持端口", "顺序分配", "随机分配"
+	Delta   int
+	Ports   []int
 }
 
-// FilteringInfo describes NAT filtering behavior
-type FilteringInfo struct {
-	EndpointIndependent bool // same mapping regardless of destination
-	AddressDependent    bool // mapping depends on destination IP
-	AddressPortDependent bool // mapping depends on destination IP+port
-}
-
-// NATReport is the full diagnostic report
 type NATReport struct {
-	LocalIP        string
-	PublicIP       string
-	PublicPort     int
-	Results        []STUNResult
-	NATType        string
-	PortConsistent bool
-	IPConsistent   bool
-	HairpinOK      bool
+	LocalIP         string
+	PhysicalIF      string
+	PublicIP        string
+	PublicPort      int
+	Results         []STUNResult
+	MappingBehavior string
+	FilterBehavior  string
+	NATType         string
+	NATTypeShort    string // NAT0-NAT4
+	PortConsistent  bool
+	IPConsistent    bool
+	HairpinOK       bool
 	BindingLifetime time.Duration
-	PortAlloc      PortAllocInfo
-	Filtering      FilteringInfo
-	Score          int    // 0-100 hole punch score
-	Difficulty     string // "Easy", "Medium", "Hard", "Very Hard", "Impossible"
-	HolePunchProb  string // "Very High", "High", "Medium", "Low", "Very Low", "None"
+	PortAlloc       PortAllocInfo
+	Score           int
+	Difficulty      string
+	HolePunchProb   string
+	RFC5780         bool // 是否使用了 RFC 5780 完整检测
 }
 
-// Default STUN servers (geographically diverse)
-var defaultSTUNServers = []string{
+// RFC 5780 服务器列表 (支持 OTHER-ADDRESS + CHANGE-REQUEST)
+var rfc5780Servers = []string{
+	"stunserver2024.stunprotocol.org:3478",
+	"stun.voipgate.com:3478",
+	"stun.sipgate.net:3478",
+}
+
+// 标准 STUN 服务器 (仅支持基本 Binding)
+var standardServers = []string{
 	"stun.cloudflare.com:3478",
 	"stun.miwifi.com:3478",
 	"stun.chat.bilibili.com:3478",
 	"stun.l.google.com:19302",
 	"stun1.l.google.com:19302",
 	"stun2.l.google.com:19302",
-	"stun.syncthing.net:3478",
 }
 
 func main() {
-	servers := flag.String("servers", "", "comma-separated STUN servers (default: built-in list)")
-	verbose := flag.Bool("v", false, "verbose output")
-	fast := flag.Bool("fast", false, "skip binding lifetime test (faster)")
+	verbose := flag.Bool("v", false, "详细输出")
+	fast := flag.Bool("fast", false, "跳过绑定生命周期测试 (更快)")
 	flag.Parse()
 
-	stunServers := defaultSTUNServers
-	if *servers != "" {
-		stunServers = strings.Split(*servers, ",")
-		for i := range stunServers {
-			stunServers[i] = strings.TrimSpace(stunServers[i])
-		}
-	}
-
 	printBanner()
-	report := runDiagnostics(stunServers, *verbose, *fast)
+
+	report := runDiagnostics(*verbose, *fast)
 	printReport(report)
 }
 
 // ════════════════════════════════════════════════════════════════
-// Banner & Visual Helpers
+// 代理绕过 — 检测物理网卡
 // ════════════════════════════════════════════════════════════════
 
-func printBanner() {
-	fmt.Println()
-	fmt.Printf("  %s%s╔══════════════════════════════════════════════╗%s\n", bold, cyan, reset)
-	fmt.Printf("  %s%s║%s  %s%s⚡ STUN Max — NAT Diagnostic Tool%s           %s%s║%s\n", bold, cyan, reset, bold, white, reset, bold, cyan, reset)
-	fmt.Printf("  %s%s║%s     Comprehensive NAT analysis & P2P check   %s%s║%s\n", bold, cyan, reset, bold, cyan, reset)
-	fmt.Printf("  %s%s╚══════════════════════════════════════════════╝%s\n", bold, cyan, reset)
-	fmt.Println()
-}
+func detectPhysicalIP() (net.IP, string) {
+	skipPrefixes := []string{
+		"utun", "tun", "tap", "lo", "docker", "br-", "veth",
+		"virbr", "vboxnet", "vmnet", "wg", "tailscale", "ts",
+		"clash", "meta", "wintun",
+	}
 
-func printSection(num int, title string) {
-	fmt.Printf("\n  %s%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n", dim, cyan, reset)
-	fmt.Printf("  %s%s  TEST %d: %s%s\n", bold, cyan, num, title, reset)
-	fmt.Printf("  %s%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n", dim, cyan, reset)
-}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, ""
+	}
 
-func spinner(done chan bool, msg string) {
-	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-	i := 0
-	for {
-		select {
-		case <-done:
-			fmt.Printf("\r  %s\r", strings.Repeat(" ", len(msg)+10))
-			return
-		default:
-			fmt.Printf("\r  %s%s%s %s", cyan, frames[i%len(frames)], reset, msg)
-			i++
-			time.Sleep(80 * time.Millisecond)
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
 		}
-	}
-}
+		if iface.Flags&net.FlagPointToPoint != 0 {
+			continue
+		}
 
-func progressBar(value, max int, width int) string {
-	if max == 0 {
-		return strings.Repeat("░", width)
-	}
-	filled := int(float64(value) / float64(max) * float64(width))
-	if filled > width {
-		filled = width
-	}
-	bar := ""
-	for i := 0; i < width; i++ {
-		if i < filled {
-			if value >= 80 {
-				bar += fmt.Sprintf("%s█%s", green, reset)
-			} else if value >= 50 {
-				bar += fmt.Sprintf("%s█%s", yellow, reset)
-			} else if value >= 30 {
-				bar += fmt.Sprintf("%s█%s", yellow, reset)
-			} else {
-				bar += fmt.Sprintf("%s█%s", red, reset)
+		nameLower := strings.ToLower(iface.Name)
+		skip := false
+		for _, p := range skipPrefixes {
+			if strings.HasPrefix(nameLower, p) {
+				skip = true
+				break
 			}
-		} else {
-			bar += fmt.Sprintf("%s░%s", gray, reset)
+		}
+		if skip {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil || len(addrs) == 0 {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipNet.IP.To4()
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+				continue
+			}
+			// 跳过 198.18.0.0/15 (Clash/V2Ray TUN常用)
+			if ip[0] == 198 && (ip[1] == 18 || ip[1] == 19) {
+				continue
+			}
+			if iface.Flags&net.FlagBroadcast != 0 {
+				return ip, iface.Name
+			}
 		}
 	}
-	return bar
+	return nil, ""
 }
 
-func difficultyStars(difficulty string) string {
-	switch difficulty {
-	case "Easy":
-		return fmt.Sprintf("%s★☆☆☆☆%s", green, reset)
-	case "Medium":
-		return fmt.Sprintf("%s★★☆☆☆%s", yellow, reset)
-	case "Hard":
-		return fmt.Sprintf("%s★★★☆☆%s", yellow, reset)
-	case "Very Hard":
-		return fmt.Sprintf("%s★★★★☆%s", red, reset)
-	case "Impossible":
-		return fmt.Sprintf("%s★★★★★%s", red, reset)
+func listenBypass() (*net.UDPConn, net.IP, string) {
+	physIP, ifName := detectPhysicalIP()
+	var laddr *net.UDPAddr
+	if physIP != nil {
+		laddr = &net.UDPAddr{IP: physIP, Port: 0}
 	}
-	return "☆☆☆☆☆"
+	conn, err := net.ListenUDP("udp4", laddr)
+	if err != nil && physIP != nil {
+		// 绑定失败，回退到默认
+		conn, err = net.ListenUDP("udp4", nil)
+		physIP = nil
+		ifName = ""
+	}
+	if err != nil {
+		return nil, physIP, ifName
+	}
+	return conn, physIP, ifName
 }
 
 // ════════════════════════════════════════════════════════════════
-// STUN Protocol Implementation
+// STUN 协议实现
 // ════════════════════════════════════════════════════════════════
 
-func buildSTUNRequest() ([]byte, []byte) {
-	req := make([]byte, stunHeaderSize)
+func buildRequest(attrs ...[]byte) ([]byte, []byte) {
+	// 计算属性总长度
+	attrLen := 0
+	for _, a := range attrs {
+		attrLen += len(a)
+	}
+
+	req := make([]byte, stunHeaderSize+attrLen)
 	binary.BigEndian.PutUint16(req[0:2], stunBindingRequest)
-	binary.BigEndian.PutUint16(req[2:4], 0) // length
+	binary.BigEndian.PutUint16(req[2:4], uint16(attrLen))
 	binary.BigEndian.PutUint32(req[4:8], stunMagicCookie)
 	txID := make([]byte, 12)
 	rand.Read(txID)
 	copy(req[8:20], txID)
+
+	// 追加属性
+	offset := stunHeaderSize
+	for _, a := range attrs {
+		copy(req[offset:], a)
+		offset += len(a)
+	}
 	return req, txID
 }
 
-func parseSTUNResponse(resp []byte, txID []byte) (string, int, error) {
-	if len(resp) < stunHeaderSize {
-		return "", 0, fmt.Errorf("response too short: %d bytes", len(resp))
+func makeChangeRequest(flags uint32) []byte {
+	attr := make([]byte, 8)
+	binary.BigEndian.PutUint16(attr[0:2], stunAttrChangeReq)
+	binary.BigEndian.PutUint16(attr[2:4], 4)
+	binary.BigEndian.PutUint32(attr[4:8], flags)
+	return attr
+}
+
+type stunResponse struct {
+	MappedAddr string
+	MappedIP   string
+	MappedPort int
+	OtherAddr  string // OTHER-ADDRESS
+	OtherIP    string
+	OtherPort  int
+	RespOrigin string // RESPONSE-ORIGIN
+	SourceAddr *net.UDPAddr // actual source address of response
+}
+
+func sendSTUN(conn *net.UDPConn, serverAddr *net.UDPAddr, req []byte, txID []byte) (*stunResponse, error) {
+	conn.SetWriteDeadline(time.Now().Add(stunTimeout))
+	if _, err := conn.WriteToUDP(req, serverAddr); err != nil {
+		return nil, fmt.Errorf("发送: %w", err)
 	}
+
+	conn.SetReadDeadline(time.Now().Add(stunTimeout))
+	buf := make([]byte, 1024)
+	n, from, err := conn.ReadFromUDP(buf)
+	if err != nil {
+		return nil, fmt.Errorf("接收: %w", err)
+	}
+
+	if n < stunHeaderSize {
+		return nil, fmt.Errorf("响应太短: %d 字节", n)
+	}
+
+	resp := buf[:n]
 	msgType := binary.BigEndian.Uint16(resp[0:2])
-	if msgType != 0x0101 {
-		return "", 0, fmt.Errorf("unexpected message type: 0x%04x", msgType)
+	if msgType != stunBindingResponse {
+		return nil, fmt.Errorf("非 Binding Response: 0x%04x", msgType)
 	}
 	if !bytes.Equal(resp[8:20], txID) {
-		return "", 0, fmt.Errorf("transaction ID mismatch")
+		return nil, fmt.Errorf("事务ID不匹配")
 	}
 
 	msgLen := int(binary.BigEndian.Uint16(resp[2:4]))
-	if stunHeaderSize+msgLen > len(resp) {
-		return "", 0, fmt.Errorf("truncated response")
+	if stunHeaderSize+msgLen > n {
+		return nil, fmt.Errorf("响应截断")
 	}
+
 	attrs := resp[stunHeaderSize : stunHeaderSize+msgLen]
+	result := &stunResponse{SourceAddr: from}
 
-	ip, port, err := findAddress(attrs, stunAttrXorMapped, true)
-	if err != nil {
-		ip, port, err = findAddress(attrs, stunAttrMapped, false)
-	}
-	return ip, port, err
-}
-
-func findAddress(attrs []byte, targetType uint16, xor bool) (string, int, error) {
+	// 解析所有属性
 	offset := 0
 	for offset+4 <= len(attrs) {
 		attrType := binary.BigEndian.Uint16(attrs[offset : offset+2])
@@ -262,26 +322,54 @@ func findAddress(attrs []byte, targetType uint16, xor bool) (string, int, error)
 		if offset+attrLen > len(attrs) {
 			break
 		}
-		if attrType == targetType {
-			return decodeAddress(attrs[offset:offset+attrLen], xor)
+
+		switch attrType {
+		case stunAttrXorMapped:
+			ip, port := decodeAddr(attrs[offset:offset+attrLen], true)
+			result.MappedIP = ip
+			result.MappedPort = port
+			result.MappedAddr = fmt.Sprintf("%s:%d", ip, port)
+		case stunAttrMapped:
+			if result.MappedAddr == "" { // XOR-MAPPED 优先
+				ip, port := decodeAddr(attrs[offset:offset+attrLen], false)
+				result.MappedIP = ip
+				result.MappedPort = port
+				result.MappedAddr = fmt.Sprintf("%s:%d", ip, port)
+			}
+		case stunAttrOtherAddr:
+			ip, port := decodeAddr(attrs[offset:offset+attrLen], false)
+			result.OtherIP = ip
+			result.OtherPort = port
+			result.OtherAddr = fmt.Sprintf("%s:%d", ip, port)
+		case stunAttrChangedAddr:
+			if result.OtherAddr == "" { // OTHER-ADDRESS 优先
+				ip, port := decodeAddr(attrs[offset:offset+attrLen], false)
+				result.OtherIP = ip
+				result.OtherPort = port
+				result.OtherAddr = fmt.Sprintf("%s:%d", ip, port)
+			}
+		case stunAttrRespOrigin:
+			ip, port := decodeAddr(attrs[offset:offset+attrLen], false)
+			result.RespOrigin = fmt.Sprintf("%s:%d", ip, port)
 		}
+
 		offset += attrLen
 		if attrLen%4 != 0 {
 			offset += 4 - (attrLen % 4)
 		}
 	}
-	return "", 0, fmt.Errorf("address attribute 0x%04x not found", targetType)
+
+	return result, nil
 }
 
-func decodeAddress(data []byte, xor bool) (string, int, error) {
+func decodeAddr(data []byte, xor bool) (string, int) {
 	if len(data) < 8 {
-		return "", 0, fmt.Errorf("address data too short")
+		return "", 0
 	}
 	family := data[1]
 	if family != 0x01 {
-		return "", 0, fmt.Errorf("unsupported family: 0x%02x (IPv6 not supported)", family)
+		return "", 0 // 仅支持 IPv4
 	}
-
 	rawPort := binary.BigEndian.Uint16(data[2:4])
 	rawIP := binary.BigEndian.Uint32(data[4:8])
 
@@ -294,155 +382,128 @@ func decodeAddress(data []byte, xor bool) (string, int, error) {
 		port = rawPort
 		ip = rawIP
 	}
-
 	ipStr := fmt.Sprintf("%d.%d.%d.%d", byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip))
-	return ipStr, int(port), nil
+	return ipStr, int(port)
 }
 
-// ════════════════════════════════════════════════════════════════
-// STUN Query Functions
-// ════════════════════════════════════════════════════════════════
-
-func querySTUN(conn *net.UDPConn, server string) STUNResult {
-	start := time.Now()
-	result := STUNResult{Server: server}
-
+func querySTUN(conn *net.UDPConn, server string) (*stunResponse, time.Duration, error) {
 	serverAddr, err := net.ResolveUDPAddr("udp4", server)
 	if err != nil {
-		result.Error = fmt.Errorf("resolve: %w", err)
-		return result
+		return nil, 0, err
 	}
-
-	req, txID := buildSTUNRequest()
-
-	conn.SetWriteDeadline(time.Now().Add(stunTimeout))
-	if _, err := conn.WriteToUDP(req, serverAddr); err != nil {
-		result.Error = fmt.Errorf("send: %w", err)
-		return result
-	}
-
-	conn.SetReadDeadline(time.Now().Add(stunTimeout))
-	buf := make([]byte, 1024)
-	n, _, err := conn.ReadFromUDP(buf)
-	if err != nil {
-		result.Error = fmt.Errorf("recv: %w", err)
-		return result
-	}
-	result.Latency = time.Since(start)
-
-	ip, port, err := parseSTUNResponse(buf[:n], txID)
-	if err != nil {
-		result.Error = err
-		return result
-	}
-
-	result.PublicIP = ip
-	result.PublicPort = port
-	result.PublicAddr = fmt.Sprintf("%s:%d", ip, port)
-	result.LocalPort = conn.LocalAddr().(*net.UDPAddr).Port
-	return result
-}
-
-func querySTUNFresh(server string) STUNResult {
-	conn, err := net.ListenUDP("udp4", nil)
-	if err != nil {
-		return STUNResult{Server: server, Error: fmt.Errorf("listen: %w", err)}
-	}
-	defer conn.Close()
-	return querySTUN(conn, server)
-}
-
-func querySTUNWithRetry(conn *net.UDPConn, server string, retries int) STUNResult {
-	for i := 0; i < retries; i++ {
-		r := querySTUN(conn, server)
-		if r.Error == nil {
-			return r
-		}
-		if i < retries-1 {
-			time.Sleep(200 * time.Millisecond)
-		}
-	}
-	return querySTUN(conn, server)
+	req, txID := buildRequest()
+	start := time.Now()
+	resp, err := sendSTUN(conn, serverAddr, req, txID)
+	latency := time.Since(start)
+	return resp, latency, err
 }
 
 // ════════════════════════════════════════════════════════════════
-// Diagnostic Tests
+// 诊断测试
 // ════════════════════════════════════════════════════════════════
 
-func runDiagnostics(stunServers []string, verbose, fast bool) NATReport {
+func runDiagnostics(verbose, fast bool) NATReport {
 	report := NATReport{}
 
-	// Detect local IP
-	report.LocalIP = getLocalIP()
-	fmt.Printf("  %s●%s Local IP:  %s%s%s\n", cyan, reset, bold, report.LocalIP, reset)
+	// 检测物理网卡 (绕过代理)
+	physIP, ifName := detectPhysicalIP()
+	if physIP != nil {
+		report.PhysicalIF = ifName
+		fmt.Printf("  %s●%s 代理绕过: %s已启用%s — 绑定到 %s (%s)\n", cyan, reset, green, reset, physIP, ifName)
+	} else {
+		fmt.Printf("  %s●%s 代理绕过: %s未检测到物理网卡%s (使用系统默认路由)\n", cyan, reset, yellow, reset)
+	}
 
-	// ─── Test 1: STUN Reachability ────────────────────────
-	printSection(1, "STUN Reachability & Endpoint Mapping")
+	report.LocalIP = getLocalIP(physIP)
+	fmt.Printf("  %s●%s 本机 IP:   %s%s%s\n", cyan, reset, bold, report.LocalIP, reset)
 	fmt.Println()
 
-	conn, err := net.ListenUDP("udp4", nil)
-	if err != nil {
-		fmt.Printf("  %s✗ Failed to create UDP socket: %v%s\n", red, err, reset)
+	// ─── 测试 1: RFC 5780 完整检测 ─────────────────
+	printSection(1, "RFC 5780 NAT 行为发现")
+
+	rfc5780OK := false
+	for _, srv := range rfc5780Servers {
+		conn, _, _ := listenBypass()
+		if conn == nil {
+			continue
+		}
+		ok := tryRFC5780(conn, srv, &report, verbose)
+		conn.Close()
+		if ok {
+			rfc5780OK = true
+			break
+		}
+	}
+
+	if !rfc5780OK {
+		fmt.Printf("    %s⚠ 无可用 RFC 5780 服务器，使用多服务器探测替代%s\n\n", yellow, reset)
+	}
+
+	// ─── 测试 2: 多服务器映射行为检测 ──────────────
+	printSection(2, "映射行为检测 (多服务器同 Socket)")
+
+	conn, _, _ := listenBypass()
+	if conn == nil {
+		fmt.Printf("    %s✗ 无法创建 UDP 套接字%s\n", red, reset)
 		report.NATType = NATBlocked
-		report.Difficulty = "Impossible"
-		report.HolePunchProb = "None"
+		report.NATTypeShort = "阻断"
 		report.Score = 0
 		return report
 	}
-	localPort := conn.LocalAddr().(*net.UDPAddr).Port
-	fmt.Printf("  %s●%s Local UDP port: %s%d%s\n\n", cyan, reset, bold, localPort, reset)
 
-	// Query all servers from same socket
-	var sameSocketResults []STUNResult
-	successCount := 0
-	for _, server := range stunServers {
-		r := querySTUN(conn, server)
-		r.LocalPort = localPort
-		sameSocketResults = append(sameSocketResults, r)
-		if r.Error != nil {
-			if verbose {
-				fmt.Printf("    %s✗%s %-38s %s%v%s\n", red, reset, server, gray, r.Error, reset)
+	localPort := conn.LocalAddr().(*net.UDPAddr).Port
+	fmt.Printf("    本机 UDP 端口: %s%d%s\n\n", bold, localPort, reset)
+
+	// 从同一 socket 查询所有标准服务器
+	var okResults []STUNResult
+	seenIPs := map[string]bool{}
+	for _, srv := range standardServers {
+		resp, latency, err := querySTUN(conn, srv)
+		r := STUNResult{Server: srv, Latency: latency, Error: err}
+		if err == nil && resp != nil {
+			r.PublicAddr = resp.MappedAddr
+			r.PublicIP = resp.MappedIP
+			r.PublicPort = resp.MappedPort
+			if resp.OtherAddr != "" {
+				r.OtherAddr = resp.OtherAddr
 			}
-		} else {
-			successCount++
+
+			// 去重同 IP 服务器
+			resolved, _ := net.ResolveUDPAddr("udp4", srv)
+			ipKey := ""
+			if resolved != nil {
+				ipKey = resolved.IP.String()
+			}
+			if !seenIPs[ipKey] {
+				seenIPs[ipKey] = true
+				okResults = append(okResults, r)
+			}
+
 			latColor := green
-			if r.Latency > 200*time.Millisecond {
+			if latency > 200*time.Millisecond {
 				latColor = yellow
-			} else if r.Latency > 500*time.Millisecond {
-				latColor = red
 			}
-			fmt.Printf("    %s✓%s %-38s → %s%-21s%s  %s%s%s\n",
-				green, reset, server, bold, r.PublicAddr, reset,
-				latColor, r.Latency.Round(time.Millisecond), reset)
+			fmt.Printf("    %s✓%s %-40s → %s%-21s%s  %s%s%s\n",
+				green, reset, srv, bold, r.PublicAddr, reset, latColor, latency.Round(time.Millisecond), reset)
+		} else if verbose {
+			fmt.Printf("    %s✗%s %-40s %s%v%s\n", red, reset, srv, gray, err, reset)
 		}
+		report.Results = append(report.Results, r)
 	}
 	conn.Close()
 
-	fmt.Printf("\n    %sReachable: %d/%d servers%s\n", dim, successCount, len(stunServers), reset)
-
-	// Filter OK results
-	var okResults []STUNResult
-	for _, r := range sameSocketResults {
-		if r.Error == nil {
-			okResults = append(okResults, r)
-		}
-	}
-
 	if len(okResults) == 0 {
-		fmt.Printf("\n  %s✗ No STUN server reachable — UDP appears to be blocked%s\n", red, reset)
+		fmt.Printf("\n    %s✗ 所有 STUN 服务器均不可达 — UDP 可能被阻断%s\n", red, reset)
 		report.NATType = NATBlocked
-		report.Difficulty = "Impossible"
-		report.HolePunchProb = "None"
+		report.NATTypeShort = "阻断"
 		report.Score = 0
-		report.Results = sameSocketResults
 		return report
 	}
 
-	report.Results = sameSocketResults
 	report.PublicIP = okResults[0].PublicIP
 	report.PublicPort = okResults[0].PublicPort
 
-	// Check consistency
+	// 检查映射一致性
 	ips := map[string]bool{}
 	ports := map[int]bool{}
 	for _, r := range okResults {
@@ -452,291 +513,258 @@ func runDiagnostics(stunServers []string, verbose, fast bool) NATReport {
 	report.IPConsistent = len(ips) == 1
 	report.PortConsistent = len(ports) == 1
 
-	fmt.Printf("\n  %s●%s Endpoint mapping analysis:\n", cyan, reset)
-	if report.IPConsistent {
-		fmt.Printf("    %s✓%s IP mapping:   %sEndpoint-Independent%s (same IP for all servers)\n", green, reset, green, reset)
-	} else {
-		fmt.Printf("    %s✗%s IP mapping:   %sEndpoint-Dependent%s (different IPs per server)\n", red, reset, red, reset)
-	}
-	if report.PortConsistent {
-		fmt.Printf("    %s✓%s Port mapping: %sEndpoint-Independent%s (same port for all servers)\n", green, reset, green, reset)
-	} else {
-		fmt.Printf("    %s✗%s Port mapping: %sEndpoint-Dependent%s (different port per server)\n", red, reset, red, reset)
+	fmt.Printf("\n    同 Socket 映射分析:\n")
+	if report.PortConsistent && report.IPConsistent {
+		fmt.Printf("      %s✓%s 端口映射: %s端点无关%s (所有服务器返回相同端口)\n", green, reset, green, reset)
+		if report.MappingBehavior == "" {
+			report.MappingBehavior = MapEndpointIndep
+		}
+	} else if report.IPConsistent && !report.PortConsistent {
+		fmt.Printf("      %s✗%s 端口映射: %s端点相关%s (不同目标返回不同端口)\n", red, reset, red, reset)
 		uniquePorts := []int{}
 		for p := range ports {
 			uniquePorts = append(uniquePorts, p)
 		}
 		sort.Ints(uniquePorts)
-		fmt.Printf("      %sObserved ports: %v%s\n", gray, uniquePorts, reset)
+		fmt.Printf("        %s观察到的端口: %v%s\n", gray, uniquePorts, reset)
+		if report.MappingBehavior == "" {
+			report.MappingBehavior = MapAddrPortDep
+		}
+	} else {
+		fmt.Printf("      %s✗%s IP 映射: %s多出口%s (不同服务器返回不同IP)\n", yellow, reset, yellow, reset)
 	}
 
-	// ─── Test 2: Port Allocation Pattern ────────────────────
-	printSection(2, "Port Allocation Pattern")
-	fmt.Println()
+	// ─── 测试 3: 端口分配模式 ─────────────────────
+	printSection(3, "端口分配模式")
+	report.PortAlloc = analyzePortAllocation(standardServers[0])
 
-	bestServer := okResults[0].Server
-	portAlloc := analyzePortAllocation(bestServer, verbose)
-	report.PortAlloc = portAlloc
-
-	switch portAlloc.Pattern {
-	case "port-preserving":
-		fmt.Printf("  %s●%s Pattern: %s%sPort Preserving%s\n", cyan, reset, bold, green, reset)
-		fmt.Printf("    %sNAT preserves your local port number — best case for P2P%s\n", gray, reset)
-	case "sequential":
-		fmt.Printf("  %s●%s Pattern: %s%sSequential%s (delta ≈ %d)\n", cyan, reset, bold, yellow, reset, portAlloc.Delta)
-		fmt.Printf("    %sPort allocation is predictable — port prediction attacks work%s\n", gray, reset)
-	case "random":
-		fmt.Printf("  %s●%s Pattern: %s%sRandom%s\n", cyan, reset, bold, red, reset)
-		fmt.Printf("    %sPort allocation is unpredictable — hole punching is harder%s\n", gray, reset)
+	switch report.PortAlloc.Pattern {
+	case "保持端口":
+		fmt.Printf("    %s●%s 分配模式: %s%s保持端口%s — NAT 保留原始本地端口号\n", cyan, reset, bold, green, reset)
+	case "顺序分配":
+		fmt.Printf("    %s●%s 分配模式: %s%s顺序分配%s (增量 ≈ %d) — 端口可预测\n", cyan, reset, bold, yellow, reset, report.PortAlloc.Delta)
+	case "随机分配":
+		fmt.Printf("    %s●%s 分配模式: %s%s随机分配%s — 端口不可预测\n", cyan, reset, bold, red, reset)
 	default:
-		fmt.Printf("  %s●%s Pattern: %s%sUnknown%s (insufficient data)\n", cyan, reset, bold, gray, reset)
+		fmt.Printf("    %s●%s 分配模式: %s无法确定%s\n", cyan, reset, gray, reset)
 	}
 
-	if len(portAlloc.Ports) > 0 && verbose {
-		fmt.Printf("    %sSampled ports: %v%s\n", gray, portAlloc.Ports, reset)
-	}
-
-	// ─── Test 3: Filtering Behavior ─────────────────────────
-	printSection(3, "NAT Filtering Behavior")
-	fmt.Println()
-
-	filtering := analyzeFiltering(okResults, stunServers)
-	report.Filtering = filtering
-
-	if filtering.EndpointIndependent {
-		fmt.Printf("  %s●%s Filtering: %s%sEndpoint-Independent%s\n", cyan, reset, bold, green, reset)
-		fmt.Printf("    %sNAT allows packets from any source — Full Cone behavior%s\n", gray, reset)
-	} else if filtering.AddressDependent {
-		fmt.Printf("  %s●%s Filtering: %s%sAddress-Dependent%s\n", cyan, reset, bold, yellow, reset)
-		fmt.Printf("    %sNAT only allows packets from contacted IPs — Restricted Cone%s\n", gray, reset)
-	} else if filtering.AddressPortDependent {
-		fmt.Printf("  %s●%s Filtering: %s%sAddress+Port-Dependent%s\n", cyan, reset, bold, yellow, reset)
-		fmt.Printf("    %sNAT only allows packets from exact contacted IP:port — Port Restricted%s\n", gray, reset)
-	} else {
-		fmt.Printf("  %s●%s Filtering: %sCould not determine%s\n", cyan, reset, gray, reset)
-		fmt.Printf("    %sMulti-address STUN server needed for precise classification%s\n", gray, reset)
-	}
-
-	// ─── Test 4: Hairpin NAT ────────────────────────────────
-	printSection(4, "Hairpin NAT (Loopback)")
-	fmt.Println()
-
-	done := make(chan bool)
-	go spinner(done, "Testing hairpin NAT...")
+	// ─── 测试 4: Hairpin NAT ─────────────────────
+	printSection(4, "Hairpin NAT 回环测试")
 	report.HairpinOK = testHairpin(okResults[0].PublicAddr)
-	done <- true
-
 	if report.HairpinOK {
-		fmt.Printf("  %s✓%s Hairpin NAT: %sSupported%s\n", green, reset, green, reset)
-		fmt.Printf("    %sYou can send packets to your own public address through the NAT%s\n", gray, reset)
+		fmt.Printf("    %s✓%s Hairpin: %s支持%s — 可通过公网地址回环\n", green, reset, green, reset)
 	} else {
-		fmt.Printf("  %s─%s Hairpin NAT: %sNot supported%s\n", gray, reset, gray, reset)
-		fmt.Printf("    %sNormal for most NATs — does not affect P2P connectivity%s\n", gray, reset)
+		fmt.Printf("    %s─%s Hairpin: %s不支持%s (大多数 NAT 如此, 不影响打洞)\n", gray, reset, gray, reset)
 	}
 
-	// ─── Test 5: Binding Lifetime ───────────────────────────
+	// ─── 测试 5: 绑定生命周期 ────────────────────
 	if !fast {
-		printSection(5, "NAT Binding Lifetime")
-		fmt.Println()
-
-		done = make(chan bool)
-		go spinner(done, "Measuring binding lifetime (10s wait)...")
-		report.BindingLifetime = testBindingLifetime(bestServer)
-		done <- true
-
+		printSection(5, "NAT 绑定生命周期")
+		fmt.Printf("    %s等待 10 秒...%s", gray, reset)
+		report.BindingLifetime = testBindingLifetime(standardServers[0])
+		fmt.Print("\r                         \r")
 		if report.BindingLifetime > 0 {
-			fmt.Printf("  %s✓%s Binding alive after %s%s%s: %sstable%s\n",
-				green, reset, bold, report.BindingLifetime, reset, green, reset)
-			fmt.Printf("    %sNAT mapping persists for at least %s — good for maintaining tunnels%s\n",
-				gray, report.BindingLifetime, reset)
+			fmt.Printf("    %s✓%s 绑定存活: %s>%s%s — 映射至少持续 %s\n", green, reset, green, report.BindingLifetime, reset, report.BindingLifetime)
 		} else {
-			fmt.Printf("  %s!%s Binding lifetime: %scould not determine%s\n", yellow, reset, yellow, reset)
-			fmt.Printf("    %sMapping may have changed during the test period%s\n", gray, reset)
+			fmt.Printf("    %s!%s 绑定存活: %s未知%s — 映射可能在 10 秒内过期\n", yellow, reset, yellow, reset)
 		}
 	}
 
-	// ─── Test 6: Port Prediction Accuracy ───────────────────
-	if !report.PortConsistent && portAlloc.Pattern == "sequential" {
-		printSection(6, "Port Prediction Accuracy")
-		fmt.Println()
-
-		accuracy := testPortPrediction(bestServer, portAlloc.Delta)
-		if accuracy > 0 {
-			fmt.Printf("  %s●%s Prediction accuracy: %s%d%%%s\n", cyan, reset, bold, accuracy, reset)
-			if accuracy >= 70 {
-				fmt.Printf("    %sBirthday attack + port prediction should work well%s\n", gray, reset)
-			} else if accuracy >= 40 {
-				fmt.Printf("    %sPort prediction partially works — multi-socket burst recommended%s\n", gray, reset)
-			} else {
-				fmt.Printf("    %sPort prediction unreliable — rely on birthday attack volume%s\n", gray, reset)
-			}
-		}
-	}
-
-	// Classify NAT
-	report.NATType = classifyNAT(report)
-
-	// Score and assess
+	// 最终分类
+	classifyNAT(&report)
 	report.Score, report.Difficulty, report.HolePunchProb = scoreHolePunch(report)
 
 	return report
 }
 
 // ════════════════════════════════════════════════════════════════
-// Port Allocation Analysis
+// RFC 5780 完整测试 (需要双 IP STUN 服务器)
 // ════════════════════════════════════════════════════════════════
 
-func analyzePortAllocation(server string, verbose bool) PortAllocInfo {
+func tryRFC5780(conn *net.UDPConn, server string, report *NATReport, verbose bool) bool {
+	fmt.Printf("    尝试 RFC 5780 服务器: %s%s%s\n", bold, server, reset)
+
+	serverAddr, err := net.ResolveUDPAddr("udp4", server)
+	if err != nil {
+		fmt.Printf("      %s✗ 解析失败: %v%s\n", red, err, reset)
+		return false
+	}
+
+	// Test I: 普通 Binding Request
+	req1, txID1 := buildRequest()
+	resp1, err := sendSTUN(conn, serverAddr, req1, txID1)
+	if err != nil {
+		fmt.Printf("      %s✗ Test I 失败: %v%s\n", red, err, reset)
+		return false
+	}
+
+	if resp1.OtherAddr == "" {
+		fmt.Printf("      %s⚠ 服务器不支持 OTHER-ADDRESS (非 RFC 5780)%s\n", yellow, reset)
+		return false
+	}
+
+	fmt.Printf("      Test I:  映射地址 = %s%s%s\n", cyan, resp1.MappedAddr, reset)
+	fmt.Printf("               OTHER-ADDRESS = %s%s%s\n", cyan, resp1.OtherAddr, reset)
+
+	report.RFC5780 = true
+
+	// === 映射行为测试 (§4.3) ===
+	fmt.Printf("\n    %s映射行为测试 (Mapping Behavior):%s\n", bold, reset)
+
+	// Test II: 发送到 OTHER-ADDRESS 的 IP, 但使用主端口
+	altAddr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", resp1.OtherIP, serverAddr.Port))
+	if err == nil {
+		req2, txID2 := buildRequest()
+		resp2, err := sendSTUN(conn, altAddr, req2, txID2)
+		if err != nil {
+			fmt.Printf("      Test II: %s超时 (目标: %s)%s\n", yellow, altAddr, reset)
+		} else {
+			fmt.Printf("      Test II: 映射地址 = %s%s%s (目标: %s)\n", cyan, resp2.MappedAddr, reset, altAddr)
+			if resp2.MappedAddr == resp1.MappedAddr {
+				report.MappingBehavior = MapEndpointIndep
+				fmt.Printf("      结果:    %s%s端点无关映射 ✓%s\n", bold, green, reset)
+			} else {
+				// Test III: 发送到 OTHER-ADDRESS 的 IP:Port
+				altAddr2, _ := net.ResolveUDPAddr("udp4", resp1.OtherAddr)
+				req3, txID3 := buildRequest()
+				resp3, err := sendSTUN(conn, altAddr2, req3, txID3)
+				if err != nil {
+					report.MappingBehavior = MapAddrPortDep
+					fmt.Printf("      Test III: %s超时%s\n", yellow, reset)
+					fmt.Printf("      结果:    %s%s地址+端口相关映射 (Symmetric)%s\n", bold, red, reset)
+				} else {
+					fmt.Printf("      Test III: 映射地址 = %s%s%s\n", cyan, resp3.MappedAddr, reset)
+					if resp3.MappedAddr == resp2.MappedAddr {
+						report.MappingBehavior = MapAddrDep
+						fmt.Printf("      结果:    %s%s地址相关映射%s\n", bold, yellow, reset)
+					} else {
+						report.MappingBehavior = MapAddrPortDep
+						fmt.Printf("      结果:    %s%s地址+端口相关映射 (Symmetric)%s\n", bold, red, reset)
+					}
+				}
+			}
+		}
+	}
+
+	// === 过滤行为测试 (§4.4) ===
+	fmt.Printf("\n    %s过滤行为测试 (Filtering Behavior):%s\n", bold, reset)
+
+	// Test II: CHANGE-REQUEST = change-IP + change-port
+	reqF2, txIDF2 := buildRequest(makeChangeRequest(changeIP | changePort))
+	_, errF2 := sendSTUN(conn, serverAddr, reqF2, txIDF2)
+	if errF2 == nil {
+		report.FilterBehavior = FilterEndpointIndep
+		fmt.Printf("      Test II: %s%s收到响应 → 端点无关过滤 (Full Cone)%s\n", bold, green, reset)
+	} else {
+		fmt.Printf("      Test II: %s超时 (change-IP+port)%s\n", gray, reset)
+
+		// Test III: CHANGE-REQUEST = change-port only
+		reqF3, txIDF3 := buildRequest(makeChangeRequest(changePort))
+		_, errF3 := sendSTUN(conn, serverAddr, reqF3, txIDF3)
+		if errF3 == nil {
+			report.FilterBehavior = FilterAddrDep
+			fmt.Printf("      Test III: %s%s收到响应 → 地址相关过滤 (Restricted Cone)%s\n", bold, yellow, reset)
+		} else {
+			report.FilterBehavior = FilterAddrPortDep
+			fmt.Printf("      Test III: %s超时 → %s地址+端口相关过滤 (Port Restricted)%s\n", gray, yellow, reset)
+		}
+	}
+
+	return true
+}
+
+// ════════════════════════════════════════════════════════════════
+// 端口分配分析
+// ════════════════════════════════════════════════════════════════
+
+func analyzePortAllocation(server string) PortAllocInfo {
 	info := PortAllocInfo{}
 
 	sampleCount := 5
-	fmt.Printf("  %sSampling %d fresh sockets...%s\n\n", gray, sampleCount, reset)
+	fmt.Printf("    采样 %d 个独立 Socket...\n\n", sampleCount)
 
+	var localPorts []int
 	for i := 0; i < sampleCount; i++ {
-		r := querySTUNFresh(server)
-		if r.Error == nil {
-			info.Ports = append(info.Ports, r.PublicPort)
-			info.LocalPorts = append(info.LocalPorts, r.LocalPort)
-			fmt.Printf("    Socket %d: local :%s%-5d%s → public :%s%-5d%s",
-				i+1, dim, r.LocalPort, reset, bold, r.PublicPort, reset)
+		conn, _, _ := listenBypass()
+		if conn == nil {
+			continue
+		}
+		resp, _, err := querySTUN(conn, server)
+		lp := conn.LocalAddr().(*net.UDPAddr).Port
+		conn.Close()
+		if err == nil && resp != nil {
+			info.Ports = append(info.Ports, resp.MappedPort)
+			localPorts = append(localPorts, lp)
+			fmt.Printf("      Socket %d: 本地 :%s%-5d%s → 公网 :%s%-5d%s", i+1, dim, lp, reset, bold, resp.MappedPort, reset)
 			if i > 0 && len(info.Ports) >= 2 {
 				delta := info.Ports[len(info.Ports)-1] - info.Ports[len(info.Ports)-2]
-				if delta >= 0 {
-					fmt.Printf("  %s(Δ +%d)%s", gray, delta, reset)
-				} else {
-					fmt.Printf("  %s(Δ %d)%s", gray, delta, reset)
-				}
+				fmt.Printf("  %s(Δ %+d)%s", gray, delta, reset)
 			}
 			fmt.Println()
 		}
-		// Small delay between samples to avoid port reuse
 		time.Sleep(50 * time.Millisecond)
 	}
+	fmt.Println()
 
 	if len(info.Ports) < 3 {
-		info.Pattern = "unknown"
+		info.Pattern = "未知"
 		return info
 	}
 
-	// Analyze deltas
+	// 检查是否保持端口
+	allSame := true
+	for i := range info.Ports {
+		if i < len(localPorts) && info.Ports[i] != localPorts[i] {
+			allSame = false
+			break
+		}
+	}
+	if allSame {
+		info.Pattern = "保持端口"
+		return info
+	}
+
+	// 检查是否顺序分配
 	sort.Ints(info.Ports)
 	deltas := make([]int, 0, len(info.Ports)-1)
 	for i := 1; i < len(info.Ports); i++ {
 		deltas = append(deltas, info.Ports[i]-info.Ports[i-1])
 	}
 
-	// Check port-preserving
-	allSame := true
-	for i := 0; i < len(info.Ports); i++ {
-		if info.Ports[i] != info.LocalPorts[i] {
-			allSame = false
-			break
-		}
+	avg := 0
+	for _, d := range deltas {
+		avg += d
 	}
-	if allSame {
-		info.Pattern = "port-preserving"
-		info.Predictable = true
-		return info
-	}
+	avg /= len(deltas)
 
-	// Check sequential (small, consistent deltas)
-	if len(deltas) >= 2 {
-		avgDelta := 0
-		maxDev := 0
-		for _, d := range deltas {
-			avgDelta += d
+	maxDev := 0
+	for _, d := range deltas {
+		dev := d - avg
+		if dev < 0 {
+			dev = -dev
 		}
-		avgDelta /= len(deltas)
-
-		for _, d := range deltas {
-			dev := abs(d - avgDelta)
-			if dev > maxDev {
-				maxDev = dev
-			}
-		}
-
-		// Sequential: average delta 1-10, deviation <= 2
-		if avgDelta >= 1 && avgDelta <= 10 && maxDev <= 3 {
-			info.Pattern = "sequential"
-			info.Delta = avgDelta
-			info.Predictable = true
-			return info
-		}
-
-		// Check if all deltas are 0 (port-preserving at NAT level)
-		allZero := true
-		for _, d := range deltas {
-			if d != 0 {
-				allZero = false
-				break
-			}
-		}
-		if allZero {
-			info.Pattern = "port-preserving"
-			info.Predictable = true
-			return info
+		if dev > maxDev {
+			maxDev = dev
 		}
 	}
 
-	info.Pattern = "random"
-	info.Predictable = false
+	if avg >= 1 && avg <= 10 && maxDev <= 3 {
+		info.Pattern = "顺序分配"
+		info.Delta = avg
+	} else {
+		info.Pattern = "随机分配"
+	}
 	return info
 }
 
 // ════════════════════════════════════════════════════════════════
-// Filtering Analysis
-// ════════════════════════════════════════════════════════════════
-
-func analyzeFiltering(results []STUNResult, servers []string) FilteringInfo {
-	info := FilteringInfo{}
-
-	// If we got consistent port from multiple servers with different IPs,
-	// it suggests endpoint-independent mapping (prerequisite for EIF)
-	if len(results) < 2 {
-		return info
-	}
-
-	// Group by server IP
-	serverIPs := map[string]bool{}
-	for _, r := range results {
-		if r.Error == nil {
-			host, _, _ := net.SplitHostPort(r.Server)
-			addrs, err := net.LookupHost(host)
-			if err == nil && len(addrs) > 0 {
-				serverIPs[addrs[0]] = true
-			}
-		}
-	}
-
-	// Check if mapping is consistent across different server IPs
-	ports := map[int]bool{}
-	for _, r := range results {
-		if r.Error == nil {
-			ports[r.PublicPort] = true
-		}
-	}
-
-	if len(ports) == 1 && len(serverIPs) >= 2 {
-		// Same port returned by servers at different IPs → endpoint-independent mapping
-		// Without a proper STUN server with CHANGE-REQUEST, we infer:
-		// - If port preserving → likely Full Cone (EIF)
-		// - If consistent but not preserving → likely Restricted or Port-Restricted
-		info.EndpointIndependent = true
-	} else if len(ports) > 1 {
-		// Different ports per destination → endpoint-dependent (Symmetric)
-		info.AddressPortDependent = true
-	}
-
-	return info
-}
-
-// ════════════════════════════════════════════════════════════════
-// Hairpin & Binding Lifetime Tests
+// Hairpin & 绑定生命周期
 // ════════════════════════════════════════════════════════════════
 
 func testHairpin(publicAddr string) bool {
-	conn, err := net.ListenUDP("udp4", nil)
-	if err != nil {
+	conn, _, _ := listenBypass()
+	if conn == nil {
 		return false
 	}
 	defer conn.Close()
@@ -749,10 +777,8 @@ func testHairpin(publicAddr string) bool {
 	token := make([]byte, 8)
 	rand.Read(token)
 	msg := append([]byte("HAIRPIN:"), token...)
-
 	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	conn.WriteToUDP(msg, addr)
-
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 256)
 	n, _, err := conn.ReadFromUDP(buf)
@@ -763,165 +789,133 @@ func testHairpin(publicAddr string) bool {
 }
 
 func testBindingLifetime(server string) time.Duration {
-	conn, err := net.ListenUDP("udp4", nil)
-	if err != nil {
+	conn, _, _ := listenBypass()
+	if conn == nil {
 		return 0
 	}
 	defer conn.Close()
 
-	r1 := querySTUNWithRetry(conn, server, 2)
-	if r1.Error != nil {
+	resp1, _, err := querySTUN(conn, server)
+	if err != nil || resp1 == nil {
 		return 0
 	}
-
 	time.Sleep(10 * time.Second)
-
-	r2 := querySTUNWithRetry(conn, server, 2)
-	if r2.Error != nil {
+	resp2, _, err := querySTUN(conn, server)
+	if err != nil || resp2 == nil {
 		return 0
 	}
-
-	if r1.PublicAddr == r2.PublicAddr {
+	if resp1.MappedAddr == resp2.MappedAddr {
 		return 10 * time.Second
 	}
 	return 0
 }
 
 // ════════════════════════════════════════════════════════════════
-// Port Prediction Accuracy Test
+// NAT 分类
 // ════════════════════════════════════════════════════════════════
 
-func testPortPrediction(server string, expectedDelta int) int {
-	if expectedDelta == 0 {
-		return 100
+func classifyNAT(report *NATReport) {
+	// 检查是否在公网
+	if report.LocalIP == report.PublicIP {
+		if report.PortConsistent {
+			report.NATType = NATOpen
+			report.NATTypeShort = "NAT0"
+		} else {
+			report.NATType = NATSymFirewall
+			report.NATTypeShort = "NAT4"
+		}
+		report.MappingBehavior = MapEndpointIndep
+		if report.FilterBehavior == "" {
+			report.FilterBehavior = FilterEndpointIndep
+		}
+		return
 	}
 
-	// Take 3 samples, predict the 4th, check
-	trials := 5
-	hits := 0
-
-	for t := 0; t < trials; t++ {
-		// Get two reference points
-		r1 := querySTUNFresh(server)
-		r2 := querySTUNFresh(server)
-		if r1.Error != nil || r2.Error != nil {
-			continue
-		}
-
-		actualDelta := r2.PublicPort - r1.PublicPort
-		predicted := r2.PublicPort + actualDelta
-
-		r3 := querySTUNFresh(server)
-		if r3.Error != nil {
-			continue
-		}
-
-		// Allow ±2 margin
-		if abs(r3.PublicPort-predicted) <= 2 {
-			hits++
-		}
-	}
-
-	if trials == 0 {
-		return 0
-	}
-	return (hits * 100) / trials
-}
-
-// ════════════════════════════════════════════════════════════════
-// NAT Classification
-// ════════════════════════════════════════════════════════════════
-
-func classifyNAT(report NATReport) string {
-	// Check if we're on public internet (no NAT)
-	if report.LocalIP != "" {
-		for _, r := range report.Results {
-			if r.Error == nil && r.PublicIP == report.LocalIP {
-				if report.PortConsistent {
-					return NATOpen
-				}
-				return NATSymmetricFirewall
+	// 基于映射行为判断
+	switch report.MappingBehavior {
+	case MapEndpointIndep:
+		// Cone NAT — 具体类型取决于过滤行为
+		switch report.FilterBehavior {
+		case FilterEndpointIndep:
+			report.NATType = NATFullCone
+			report.NATTypeShort = "NAT1"
+		case FilterAddrDep:
+			report.NATType = NATRestrictedCone
+			report.NATTypeShort = "NAT2"
+		case FilterAddrPortDep:
+			report.NATType = NATPortRestricted
+			report.NATTypeShort = "NAT3"
+		default:
+			// 无 RFC 5780 数据，保守估计
+			if report.PortAlloc.Pattern == "保持端口" {
+				report.NATType = NATFullCone
+				report.NATTypeShort = "NAT1"
+			} else {
+				report.NATType = NATPortRestricted
+				report.NATTypeShort = "NAT3"
 			}
+			report.FilterBehavior = FilterUnknown
+		}
+	case MapAddrDep, MapAddrPortDep:
+		report.NATType = NATSymmetric
+		report.NATTypeShort = "NAT4"
+		if report.FilterBehavior == "" {
+			report.FilterBehavior = FilterAddrPortDep
+		}
+	default:
+		// 从端口一致性推断
+		if report.PortConsistent {
+			report.NATType = NATPortRestricted
+			report.NATTypeShort = "NAT3"
+			report.MappingBehavior = MapEndpointIndep
+			report.FilterBehavior = FilterUnknown
+		} else {
+			report.NATType = NATSymmetric
+			report.NATTypeShort = "NAT4"
+			report.MappingBehavior = MapAddrPortDep
+			report.FilterBehavior = FilterAddrPortDep
 		}
 	}
-
-	// Port changes per destination → Symmetric NAT
-	if !report.PortConsistent {
-		return NATSymmetric
-	}
-
-	// Port consistent — some type of Cone NAT
-	if report.PortAlloc.Pattern == "port-preserving" {
-		// Port-preserving + endpoint-independent = Full Cone
-		if report.Filtering.EndpointIndependent {
-			return NATFullCone
-		}
-		// Port-preserving but can't confirm filtering → assume Full Cone
-		return NATFullCone
-	}
-
-	// Port consistent but not port-preserving
-	if report.Filtering.EndpointIndependent {
-		return NATRestrictedCone
-	}
-
-	// Default: can't distinguish restricted from port-restricted without
-	// multi-address STUN server, but port-consistent suggests cone NAT
-	// If filtering analysis shows address-dependent → Restricted Cone
-	if report.Filtering.AddressDependent {
-		return NATRestrictedCone
-	}
-
-	return NATPortRestricted
 }
 
 // ════════════════════════════════════════════════════════════════
-// Hole Punch Scoring
+// 打洞评分
 // ════════════════════════════════════════════════════════════════
 
-func scoreHolePunch(report NATReport) (int, string, string) {
+func scoreHolePunch(r NATReport) (int, string, string) {
 	score := 0
 
-	switch report.NATType {
-	case NATOpen:
+	switch r.NATTypeShort {
+	case "NAT0":
 		score = 100
-	case NATFullCone:
+	case "NAT1":
 		score = 95
-	case NATRestrictedCone:
+	case "NAT2":
 		score = 85
-	case NATPortRestricted:
+	case "NAT3":
 		score = 65
-	case NATSymmetric:
-		score = 30
-	case NATSymmetricFirewall:
+	case "NAT4":
 		score = 25
-	case NATBlocked:
+	default:
 		score = 0
 	}
 
-	// Adjust for port allocation
-	if report.NATType == NATSymmetric {
-		switch report.PortAlloc.Pattern {
-		case "port-preserving":
-			score += 25 // unusual but great
-		case "sequential":
-			score += 20 // predictable, birthday attack works well
-		case "random":
-			score -= 10 // worst case
+	if r.NATTypeShort == "NAT4" {
+		switch r.PortAlloc.Pattern {
+		case "保持端口":
+			score += 25
+		case "顺序分配":
+			score += 20
 		}
 	}
 
-	// Adjust for binding lifetime
-	if report.BindingLifetime > 0 {
+	if r.BindingLifetime > 0 {
 		score += 5
 	}
-
-	// Adjust for hairpin
-	if report.HairpinOK {
+	if r.HairpinOK {
 		score += 2
 	}
 
-	// Clamp
 	if score > 100 {
 		score = 100
 	}
@@ -929,325 +923,303 @@ func scoreHolePunch(report NATReport) (int, string, string) {
 		score = 0
 	}
 
-	// Map to difficulty and probability
-	var difficulty, prob string
+	var diff, prob string
 	switch {
 	case score >= 90:
-		difficulty = "Easy"
-		prob = "Very High"
+		diff = "简单"
+		prob = "极高"
 	case score >= 75:
-		difficulty = "Easy"
-		prob = "High"
+		diff = "简单"
+		prob = "高"
 	case score >= 60:
-		difficulty = "Medium"
-		prob = "Medium"
+		diff = "中等"
+		prob = "中等"
 	case score >= 40:
-		difficulty = "Hard"
-		prob = "Medium"
+		diff = "困难"
+		prob = "中等"
 	case score >= 20:
-		difficulty = "Very Hard"
-		prob = "Low"
+		diff = "很困难"
+		prob = "低"
 	case score > 0:
-		difficulty = "Very Hard"
-		prob = "Very Low"
+		diff = "极其困难"
+		prob = "极低"
 	default:
-		difficulty = "Impossible"
-		prob = "None"
+		diff = "不可能"
+		prob = "无"
 	}
 
-	return score, difficulty, prob
+	return score, diff, prob
 }
 
 // ════════════════════════════════════════════════════════════════
-// Report Output
+// 报告输出
 // ════════════════════════════════════════════════════════════════
 
-func printReport(report NATReport) {
-	fmt.Printf("\n\n  %s%s╔══════════════════════════════════════════════╗%s\n", bold, cyan, reset)
-	fmt.Printf("  %s%s║%s  %s%sNAT Diagnostic Report%s                        %s%s║%s\n", bold, cyan, reset, bold, white, reset, bold, cyan, reset)
-	fmt.Printf("  %s%s╚══════════════════════════════════════════════╝%s\n\n", bold, cyan, reset)
+func printBanner() {
+	fmt.Println()
+	fmt.Printf("  %s%s╔════════════════════════════════════════════════════╗%s\n", bold, cyan, reset)
+	fmt.Printf("  %s%s║%s  %s%s⚡ STUN Max — NAT 全类型诊断工具%s                 %s%s║%s\n", bold, cyan, reset, bold, white, reset, bold, cyan, reset)
+	fmt.Printf("  %s%s║%s     RFC 5780 行为发现 + 代理绕过 + 打洞评估      %s%s║%s\n", bold, cyan, reset, bold, cyan, reset)
+	fmt.Printf("  %s%s╚════════════════════════════════════════════════════╝%s\n", bold, cyan, reset)
+	fmt.Println()
+}
 
-	// ─── Network Info ────────────────────────────────────
-	fmt.Printf("  %s%s  Network Information%s\n", bold, white, reset)
-	fmt.Printf("  %s──────────────────────────────────────────────%s\n", gray, reset)
-	fmt.Printf("  %-24s %s\n", "  Local IP:", report.LocalIP)
+func printSection(num int, title string) {
+	fmt.Printf("\n  %s%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n", dim, cyan, reset)
+	fmt.Printf("  %s%s  测试 %d: %s%s\n", bold, cyan, num, title, reset)
+	fmt.Printf("  %s%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n\n", dim, cyan, reset)
+}
 
+func progressBar(value, max, width int) string {
+	if max == 0 {
+		return strings.Repeat("░", width)
+	}
+	filled := value * width / max
+	if filled > width {
+		filled = width
+	}
+	bar := ""
+	for i := 0; i < width; i++ {
+		if i < filled {
+			c := red
+			if value >= 80 {
+				c = green
+			} else if value >= 50 {
+				c = yellow
+			}
+			bar += c + "█" + reset
+		} else {
+			bar += gray + "░" + reset
+		}
+	}
+	return bar
+}
+
+func difficultyStars(d string) string {
+	switch d {
+	case "简单":
+		return green + "★☆☆☆☆" + reset
+	case "中等":
+		return yellow + "★★☆☆☆" + reset
+	case "困难":
+		return yellow + "★★★☆☆" + reset
+	case "很困难":
+		return red + "★★★★☆" + reset
+	case "极其困难":
+		return red + "★★★★★" + reset
+	case "不可能":
+		return red + "★★★★★" + reset
+	}
+	return "☆☆☆☆☆"
+}
+
+func printReport(r NATReport) {
+	fmt.Printf("\n\n  %s%s╔════════════════════════════════════════════════════╗%s\n", bold, cyan, reset)
+	fmt.Printf("  %s%s║%s  %s%sNAT 诊断报告%s                                     %s%s║%s\n", bold, cyan, reset, bold, white, reset, bold, cyan, reset)
+	fmt.Printf("  %s%s╚════════════════════════════════════════════════════╝%s\n\n", bold, cyan, reset)
+
+	// ─── 网络信息 ────────────────────────────────
+	fmt.Printf("  %s%s  网络信息%s\n", bold, white, reset)
+	fmt.Printf("  %s────────────────────────────────────────────────────%s\n", gray, reset)
+	fmt.Printf("    %-20s %s\n", "本机 IP:", r.LocalIP)
+	if r.PhysicalIF != "" {
+		fmt.Printf("    %-20s %s\n", "物理网卡:", r.PhysicalIF)
+	}
 	seen := map[string]bool{}
-	for _, r := range report.Results {
-		if r.Error == nil && !seen[r.PublicAddr] {
-			seen[r.PublicAddr] = true
-			fmt.Printf("  %-24s %s%s%s\n", "  Public Address:", bold, r.PublicAddr, reset)
+	for _, res := range r.Results {
+		if res.Error == nil && !seen[res.PublicAddr] {
+			seen[res.PublicAddr] = true
+			fmt.Printf("    %-20s %s%s%s\n", "公网地址:", bold, res.PublicAddr, reset)
 		}
 	}
 	fmt.Println()
 
-	// ─── NAT Type ────────────────────────────────────────
-	fmt.Printf("  %s%s  NAT Classification%s\n", bold, white, reset)
-	fmt.Printf("  %s──────────────────────────────────────────────%s\n", gray, reset)
+	// ─── NAT 分类 ────────────────────────────────
+	fmt.Printf("  %s%s  NAT 分类%s\n", bold, white, reset)
+	fmt.Printf("  %s────────────────────────────────────────────────────%s\n", gray, reset)
 
 	natColor := green
-	natIcon := "✓"
-	natDesc := ""
-	switch report.NATType {
-	case NATOpen:
-		natDesc = "No NAT — direct internet access"
-	case NATFullCone:
-		natDesc = "Any external host can send through the mapped port"
-	case NATRestrictedCone:
-		natColor = green
-		natDesc = "Only hosts you've contacted can reply (IP filter)"
-	case NATPortRestricted:
+	switch r.NATTypeShort {
+	case "NAT3":
 		natColor = yellow
-		natIcon = "~"
-		natDesc = "Only exact IP:port you've contacted can reply"
-	case NATSymmetric:
+	case "NAT4", "阻断":
 		natColor = red
-		natIcon = "✗"
-		natDesc = "Different external port per destination — hardest to traverse"
-	case NATSymmetricFirewall:
-		natColor = red
-		natIcon = "!"
-		natDesc = "Public IP but port varies — unusual configuration"
-	case NATBlocked:
-		natColor = red
-		natIcon = "✗"
-		natDesc = "UDP traffic is blocked entirely"
 	}
-	fmt.Printf("  %s  %s%s %-20s %s%s%s\n", "", natColor, natIcon, "NAT Type:", bold+natColor, report.NATType, reset)
-	fmt.Printf("  %s  %s%s%s\n", "", "  ", gray, natDesc+reset)
-	fmt.Println()
 
-	// Mapping details
-	mark := func(ok bool, yesText, noText string) string {
+	fmt.Printf("    %-20s %s%s%s %s(%s)%s\n", "NAT 类型:", bold+natColor, r.NATType, reset, gray, r.NATTypeShort, reset)
+	fmt.Printf("    %-20s %s\n", "映射行为:", r.MappingBehavior)
+	fmt.Printf("    %-20s %s\n", "过滤行为:", r.FilterBehavior)
+	if r.RFC5780 {
+		fmt.Printf("    %-20s %s✓ RFC 5780 完整检测%s\n", "检测方法:", green, reset)
+	} else {
+		fmt.Printf("    %-20s %s多服务器映射探测 (过滤行为为推断)%s\n", "检测方法:", yellow, reset)
+	}
+	fmt.Printf("    %-20s %s\n", "端口分配:", portAllocStr(r.PortAlloc))
+
+	mark := func(ok bool, y, n string) string {
 		if ok {
-			return fmt.Sprintf("%s✓ %s%s", green, yesText, reset)
+			return green + "✓ " + y + reset
 		}
-		return fmt.Sprintf("%s✗ %s%s", red, noText, reset)
+		return gray + "─ " + n + reset
 	}
-
-	fmt.Printf("    %-24s %s\n", "Port Mapping:", mark(report.PortConsistent, "Endpoint-Independent", "Endpoint-Dependent"))
-	fmt.Printf("    %-24s %s\n", "IP Mapping:", mark(report.IPConsistent, "Consistent", "Varies per destination"))
-	fmt.Printf("    %-24s %s\n", "Port Allocation:", portAllocStr(report.PortAlloc))
-	fmt.Printf("    %-24s %s\n", "Hairpin NAT:", mark(report.HairpinOK, "Supported", "Not supported"))
-	if report.BindingLifetime > 0 {
-		fmt.Printf("    %-24s %s✓ >%s%s\n", "Binding Lifetime:", green, report.BindingLifetime, reset)
+	fmt.Printf("    %-20s %s\n", "Hairpin NAT:", mark(r.HairpinOK, "支持", "不支持"))
+	if r.BindingLifetime > 0 {
+		fmt.Printf("    %-20s %s✓ >%s%s\n", "绑定生命周期:", green, r.BindingLifetime, reset)
 	}
 	fmt.Println()
 
-	// ─── P2P Assessment ──────────────────────────────────
-	fmt.Printf("  %s%s  P2P Hole Punch Assessment%s\n", bold, white, reset)
-	fmt.Printf("  %s──────────────────────────────────────────────%s\n", gray, reset)
+	// ─── 打洞评估 ────────────────────────────────
+	fmt.Printf("  %s%s  P2P 打洞评估%s\n", bold, white, reset)
+	fmt.Printf("  %s────────────────────────────────────────────────────%s\n", gray, reset)
 
-	// Score bar
-	fmt.Printf("    Score: %s %s%s%d/100%s\n",
-		progressBar(report.Score, 100, 25),
-		bold, scoreColor(report.Score), report.Score, reset)
+	sColor := green
+	if r.Score < 50 {
+		sColor = red
+	} else if r.Score < 75 {
+		sColor = yellow
+	}
 
-	// Difficulty
-	fmt.Printf("    Difficulty:       %s  %s%s%s%s\n",
-		difficultyStars(report.Difficulty),
-		bold, difficultyColor(report.Difficulty), report.Difficulty, reset)
-
-	// Success probability
-	fmt.Printf("    Success Rate:     %s%s%s%s\n",
-		bold, probColor(report.HolePunchProb), report.HolePunchProb, reset)
-
+	fmt.Printf("    综合评分:     %s %s%s%d/100%s\n", progressBar(r.Score, 100, 25), bold, sColor, r.Score, reset)
+	fmt.Printf("    打洞难度:     %s  %s%s%s\n", difficultyStars(r.Difficulty), bold, r.Difficulty, reset)
+	fmt.Printf("    成功概率:     %s%s%s\n", bold, r.HolePunchProb, reset)
 	fmt.Println()
 
-	// ─── STUN Max Strategy ───────────────────────────────
-	fmt.Printf("  %s%s  STUN Max Strategy%s\n", bold, white, reset)
-	fmt.Printf("  %s──────────────────────────────────────────────%s\n", gray, reset)
-	printStrategy(report)
+	// ─── 兼容矩阵 ────────────────────────────────
+	fmt.Printf("  %s%s  与各类 NAT 对端的打洞兼容性%s\n", bold, white, reset)
+	fmt.Printf("  %s────────────────────────────────────────────────────%s\n", gray, reset)
+	printCompatibility(r)
 	fmt.Println()
 
-	// ─── Compatibility Matrix ────────────────────────────
-	fmt.Printf("  %s%s  Peer Compatibility Matrix%s\n", bold, white, reset)
-	fmt.Printf("  %s──────────────────────────────────────────────%s\n", gray, reset)
-	printCompatibilityMatrix(report)
+	// ─── 打洞策略 ────────────────────────────────
+	fmt.Printf("  %s%s  STUN Max 打洞策略%s\n", bold, white, reset)
+	fmt.Printf("  %s────────────────────────────────────────────────────%s\n", gray, reset)
+	printStrategy(r)
+	fmt.Println()
 
-	// ─── Latency ─────────────────────────────────────────
-	printLatencySummary(report)
+	// ─── 延迟统计 ────────────────────────────────
+	printLatency(r)
 
-	// ─── Recommendation ──────────────────────────────────
-	fmt.Printf("  %s%s  Recommendation%s\n", bold, white, reset)
-	fmt.Printf("  %s──────────────────────────────────────────────%s\n", gray, reset)
-	printRecommendation(report)
+	// ─── 建议 ────────────────────────────────────
+	fmt.Printf("  %s%s  建议%s\n", bold, white, reset)
+	fmt.Printf("  %s────────────────────────────────────────────────────%s\n", gray, reset)
+	printAdvice(r)
 
+	// ─── NAT 类型说明 ────────────────────────────
+	fmt.Printf("  %s%s  NAT 类型速查表%s\n", bold, white, reset)
+	fmt.Printf("  %s────────────────────────────────────────────────────%s\n", gray, reset)
+	printNATTable(r.NATTypeShort)
 	fmt.Println()
 }
 
 func portAllocStr(p PortAllocInfo) string {
 	switch p.Pattern {
-	case "port-preserving":
-		return fmt.Sprintf("%sPort Preserving%s", green, reset)
-	case "sequential":
-		return fmt.Sprintf("%sSequential (Δ=%d)%s", yellow, p.Delta, reset)
-	case "random":
-		return fmt.Sprintf("%sRandom%s", red, reset)
+	case "保持端口":
+		return green + "保持端口" + reset
+	case "顺序分配":
+		return yellow + fmt.Sprintf("顺序分配 (Δ=%d)", p.Delta) + reset
+	case "随机分配":
+		return red + "随机分配" + reset
 	}
-	return fmt.Sprintf("%sUnknown%s", gray, reset)
+	return gray + "未知" + reset
 }
 
-func scoreColor(score int) string {
-	if score >= 75 {
-		return green
-	} else if score >= 50 {
-		return yellow
+func printCompatibility(r NATReport) {
+	type row struct {
+		peer, result, note string
+		color              string
 	}
-	return red
+
+	var matrix []row
+	switch r.NATTypeShort {
+	case "NAT0", "NAT1":
+		matrix = []row{
+			{"NAT1 完全锥形", "✓ 直连", "立即建立", green},
+			{"NAT2 受限锥形", "✓ 直连", "初次联系后", green},
+			{"NAT3 端口受限", "✓ 直连", "双方互发", green},
+			{"NAT4 对称型 (顺序)", "✓ 直连", "端口预测", green},
+			{"NAT4 对称型 (随机)", "✓ 直连", "Birthday 攻击", green},
+		}
+	case "NAT2":
+		matrix = []row{
+			{"NAT1 完全锥形", "✓ 直连", "立即建立", green},
+			{"NAT2 受限锥形", "✓ 直连", "双方互发", green},
+			{"NAT3 端口受限", "✓ 直连", "双方互发", green},
+			{"NAT4 对称型 (顺序)", "~ 可能", "Birthday + 预测", yellow},
+			{"NAT4 对称型 (随机)", "✗ 中继", "概率太低", red},
+		}
+	case "NAT3":
+		matrix = []row{
+			{"NAT1 完全锥形", "✓ 直连", "立即建立", green},
+			{"NAT2 受限锥形", "✓ 直连", "双方互发", green},
+			{"NAT3 端口受限", "✓ 直连", "双方互发", green},
+			{"NAT4 对称型 (顺序)", "~ 可能", "Birthday 256 sockets ≈98%", yellow},
+			{"NAT4 对称型 (随机)", "~ 可能", "Birthday 256 sockets ≈98%", yellow},
+		}
+	case "NAT4":
+		if r.PortAlloc.Pattern == "顺序分配" {
+			matrix = []row{
+				{"NAT1 完全锥形", "✓ 直连", "对端接受任意来源", green},
+				{"NAT2 受限锥形", "~ 可能", "端口预测", yellow},
+				{"NAT3 端口受限", "~ 可能", "Birthday 256 sockets ≈98%", yellow},
+				{"NAT4 对称型", "✗ 中继", "双方端口均不可预测", red},
+			}
+		} else {
+			matrix = []row{
+				{"NAT1 完全锥形", "✓ 直连", "对端接受任意来源", green},
+				{"NAT2 受限锥形", "~ 可能", "Birthday 攻击", yellow},
+				{"NAT3 端口受限", "~ 可能", "Birthday 256 sockets ≈98%", yellow},
+				{"NAT4 对称型", "✗ 中继", "碰撞概率 ≈0.01%", red},
+			}
+		}
+	default:
+		matrix = []row{
+			{"任何类型", "✗ 阻断", "UDP 不可用", red},
+		}
+	}
+
+	fmt.Printf("    %-28s %-10s %s\n", "对端 NAT 类型", "结果", "说明")
+	fmt.Printf("    %s─────────────────────────────────────────────────%s\n", gray, reset)
+	for _, m := range matrix {
+		fmt.Printf("    %-28s %s%-10s%s %s%s%s\n", m.peer, m.color, m.result, reset, gray, m.note, reset)
+	}
 }
 
-func difficultyColor(d string) string {
-	switch d {
-	case "Easy":
-		return green
-	case "Medium":
-		return yellow
-	case "Hard":
-		return yellow
-	case "Very Hard":
-		return red
-	case "Impossible":
-		return red
-	}
-	return gray
-}
-
-func probColor(p string) string {
-	switch p {
-	case "Very High", "High":
-		return green
-	case "Medium":
-		return yellow
-	case "Low", "Very Low":
-		return red
-	case "None":
-		return red
-	}
-	return gray
-}
-
-func printStrategy(report NATReport) {
-	type strategy struct {
-		name    string
-		enabled bool
-		desc    string
+func printStrategy(r NATReport) {
+	type strat struct {
+		name, desc string
+		active     bool
 	}
 
-	strategies := []strategy{
-		{
-			name:    "Phase 1: Rapid Burst",
-			enabled: report.NATType != NATBlocked,
-			desc:    "20 packets in 500ms from main socket",
-		},
-		{
-			name:    "Phase 2: Birthday Attack",
-			enabled: report.NATType == NATSymmetric || report.NATType == NATPortRestricted,
-			desc:    "8 parallel sockets × 5 packets each",
-		},
-		{
-			name:    "Phase 3: Port Prediction",
-			enabled: report.NATType == NATSymmetric && report.PortAlloc.Pattern == "sequential",
-			desc:    fmt.Sprintf("Predict ±10 ports around target (Δ=%d)", report.PortAlloc.Delta),
-		},
-		{
-			name:    "Fallback: Server Relay",
-			enabled: true,
-			desc:    "Automatic fallback if P2P fails after 5 attempts",
-		},
+	isNAT4 := r.NATTypeShort == "NAT4"
+	isNAT3 := r.NATTypeShort == "NAT3"
+
+	strategies := []strat{
+		{"Phase 1: 快速脉冲", "主 Socket 发送 20-40 个 PUNCH 包", r.NATTypeShort != "阻断"},
+		{"Phase 2: Birthday 攻击", "256 个并行 Socket 各发 4 包", isNAT3 || isNAT4},
+		{"Phase 3: 端口预测", fmt.Sprintf("扫描目标端口 ±%d 范围", func() int {
+			if isNAT4 {
+				return 50
+			}
+			return 20
+		}()), isNAT4},
+		{"Phase 4: 随机端口扫射", "Cone 端扫射 1024 个随机端口", isNAT3 && !isNAT4},
+		{"回退: 服务器中继", "打洞失败后自动使用加密中继", true},
 	}
 
 	for _, s := range strategies {
-		if s.enabled {
-			fmt.Printf("    %s●%s %-28s %s%s%s\n", green, reset, s.name, gray, s.desc, reset)
+		if s.active {
+			fmt.Printf("    %s●%s %-24s %s%s%s\n", green, reset, s.name, gray, s.desc, reset)
 		} else {
-			fmt.Printf("    %s○%s %-28s %s%s (not needed)%s\n", gray, reset, s.name, gray, s.desc, reset)
+			fmt.Printf("    %s○%s %-24s %s%s (不需要)%s\n", gray, reset, s.name, gray, s.desc, reset)
 		}
 	}
 }
 
-func printCompatibilityMatrix(report NATReport) {
-	type compat struct {
-		peerNAT string
-		result  string
-		color   string
-		note    string
-	}
-
-	var matrix []compat
-	switch report.NATType {
-	case NATOpen, NATFullCone:
-		matrix = []compat{
-			{"Open / Full Cone", "✓ Direct", green, "Immediate connection"},
-			{"Restricted Cone", "✓ Direct", green, "After initial contact"},
-			{"Port Restricted Cone", "✓ Direct", green, "After mutual contact"},
-			{"Symmetric (Sequential)", "✓ Direct", green, "Port prediction helps"},
-			{"Symmetric (Random)", "✓ Direct", green, "Birthday attack works"},
-		}
-	case NATRestrictedCone:
-		matrix = []compat{
-			{"Open / Full Cone", "✓ Direct", green, "Immediate"},
-			{"Restricted Cone", "✓ Direct", green, "Mutual burst"},
-			{"Port Restricted Cone", "✓ Direct", green, "Mutual burst"},
-			{"Symmetric (Sequential)", "~ Maybe", yellow, "Birthday + prediction"},
-			{"Symmetric (Random)", "✗ Relay", red, "Too many combinations"},
-		}
-	case NATPortRestricted:
-		matrix = []compat{
-			{"Open / Full Cone", "✓ Direct", green, "Immediate"},
-			{"Restricted Cone", "✓ Direct", green, "Mutual burst"},
-			{"Port Restricted Cone", "~ Maybe", yellow, "Tight timing needed"},
-			{"Symmetric (Sequential)", "✗ Relay", red, "Port mismatch"},
-			{"Symmetric (Random)", "✗ Relay", red, "Impossible to match"},
-		}
-	case NATSymmetric:
-		if report.PortAlloc.Pattern == "sequential" {
-			matrix = []compat{
-				{"Open / Full Cone", "✓ Direct", green, "Peer accepts any source"},
-				{"Restricted Cone", "~ Maybe", yellow, "Port prediction needed"},
-				{"Port Restricted Cone", "✗ Relay", red, "Both sides unpredictable"},
-				{"Symmetric (Sequential)", "✗ Relay", red, "Double prediction fails"},
-				{"Symmetric (Random)", "✗ Relay", red, "No viable strategy"},
-			}
-		} else {
-			matrix = []compat{
-				{"Open / Full Cone", "✓ Direct", green, "Peer accepts any source"},
-				{"Restricted Cone", "~ Maybe", yellow, "Birthday attack needed"},
-				{"Port Restricted Cone", "✗ Relay", red, "Too restrictive"},
-				{"Symmetric", "✗ Relay", red, "Both sides unpredictable"},
-			}
-		}
-	case NATSymmetricFirewall:
-		matrix = []compat{
-			{"Open / Full Cone", "~ Maybe", yellow, "Firewall may interfere"},
-			{"Restricted Cone", "✗ Relay", red, "Port mismatch"},
-			{"Port Restricted Cone", "✗ Relay", red, "Port mismatch"},
-			{"Symmetric", "✗ Relay", red, "Both sides vary"},
-		}
-	default:
-		matrix = []compat{
-			{"Any NAT type", "✗ Blocked", red, "UDP not available"},
-		}
-	}
-
-	// Table header
-	fmt.Printf("    %-30s %-12s %s\n",
-		fmt.Sprintf("%sPeer NAT Type%s", underline, reset),
-		fmt.Sprintf("%sResult%s", underline, reset),
-		fmt.Sprintf("%sNote%s", underline, reset))
-
-	for _, m := range matrix {
-		fmt.Printf("    %-30s %s%-12s%s %s%s%s\n",
-			m.peerNAT, m.color, m.result, reset, gray, m.note, reset)
-	}
-	fmt.Println()
-}
-
-func printLatencySummary(report NATReport) {
+func printLatency(r NATReport) {
 	var latencies []time.Duration
-	for _, r := range report.Results {
-		if r.Error == nil {
-			latencies = append(latencies, r.Latency)
+	for _, res := range r.Results {
+		if res.Error == nil {
+			latencies = append(latencies, res.Latency)
 		}
 	}
 	if len(latencies) == 0 {
@@ -1263,169 +1235,109 @@ func printLatencySummary(report NATReport) {
 	}
 	avgL := sum / time.Duration(len(latencies))
 
-	// Jitter (standard deviation)
 	var variance float64
-	avgNs := float64(avgL.Nanoseconds())
 	for _, l := range latencies {
-		d := float64(l.Nanoseconds()) - avgNs
+		d := float64(l.Nanoseconds()) - float64(avgL.Nanoseconds())
 		variance += d * d
 	}
 	jitter := time.Duration(math.Sqrt(variance/float64(len(latencies)))) * time.Nanosecond
 
-	fmt.Printf("  %s%s  STUN Latency%s\n", bold, white, reset)
-	fmt.Printf("  %s──────────────────────────────────────────────%s\n", gray, reset)
-	fmt.Printf("    Min: %s%-8s%s  Avg: %s%-8s%s  Max: %s%-8s%s  Jitter: %s%s%s\n",
+	fmt.Printf("  %s%s  STUN 延迟%s\n", bold, white, reset)
+	fmt.Printf("  %s────────────────────────────────────────────────────%s\n", gray, reset)
+	fmt.Printf("    最小: %s%-8s%s  平均: %s%-8s%s  最大: %s%-8s%s  抖动: %s%s%s\n",
 		green, minL.Round(time.Millisecond), reset,
 		cyan, avgL.Round(time.Millisecond), reset,
-		latencyColor(maxL), maxL.Round(time.Millisecond), reset,
-		jitterColor(jitter), jitter.Round(time.Millisecond), reset)
+		func() string {
+			if maxL > 300*time.Millisecond {
+				return red
+			}
+			if maxL > 100*time.Millisecond {
+				return yellow
+			}
+			return green
+		}(), maxL.Round(time.Millisecond), reset,
+		func() string {
+			if jitter > 50*time.Millisecond {
+				return red
+			}
+			if jitter > 20*time.Millisecond {
+				return yellow
+			}
+			return green
+		}(), jitter.Round(time.Millisecond), reset)
 	fmt.Println()
 }
 
-func latencyColor(d time.Duration) string {
-	if d < 100*time.Millisecond {
-		return green
-	} else if d < 300*time.Millisecond {
-		return yellow
-	}
-	return red
-}
-
-func jitterColor(d time.Duration) string {
-	if d < 20*time.Millisecond {
-		return green
-	} else if d < 50*time.Millisecond {
-		return yellow
-	}
-	return red
-}
-
-func printRecommendation(report NATReport) {
+func printAdvice(r NATReport) {
 	switch {
-	case report.Score >= 85:
-		fmt.Printf("    %s✓ Your network is excellent for P2P connections.%s\n", green, reset)
-		fmt.Printf("    %s  Direct tunnel to most peers will succeed on first attempt.%s\n", green, reset)
-		if report.NATType == NATOpen {
-			fmt.Printf("    %s  No NAT traversal needed — you have a public IP.%s\n", green, reset)
-		}
-	case report.Score >= 60:
-		fmt.Printf("    %s~ Your network supports P2P in most scenarios.%s\n", yellow, reset)
-		fmt.Printf("    %s  Direct connections work with Full/Restricted Cone peers.%s\n", yellow, reset)
-		fmt.Printf("    %s  Symmetric NAT peers may require server relay.%s\n", yellow, reset)
-		fmt.Printf("    %s  STUN Max will auto-fallback to relay if P2P fails.%s\n", gray, reset)
-	case report.Score >= 35:
-		fmt.Printf("    %s! P2P connections are possible but challenging.%s\n", yellow, reset)
-		fmt.Printf("    %s  STUN Max uses Birthday Attack + Port Prediction to maximize success.%s\n", yellow, reset)
-		fmt.Printf("    %s  Peers behind Symmetric NAT will use server relay.%s\n", yellow, reset)
-		fmt.Printf("    %s  Consider deploying a custom STUN server for better results.%s\n", gray, reset)
-	case report.Score > 0:
-		fmt.Printf("    %s✗ P2P hole punching is unlikely to succeed from this network.%s\n", red, reset)
-		fmt.Printf("    %s  Most connections will use server relay (encrypted, but higher latency).%s\n", red, reset)
-		fmt.Printf("\n    %sSuggestions:%s\n", bold, reset)
-		fmt.Printf("    %s  • Try a different network (mobile hotspot, different WiFi)%s\n", gray, reset)
-		fmt.Printf("    %s  • Deploy STUN Max server closer to your region%s\n", gray, reset)
-		fmt.Printf("    %s  • Check if your router supports UPnP or NAT-PMP%s\n", gray, reset)
-		fmt.Printf("    %s  • Consider port forwarding on your router%s\n", gray, reset)
+	case r.Score >= 85:
+		fmt.Printf("    %s✓ 你的网络非常适合 P2P 直连。%s\n", green, reset)
+		fmt.Printf("    %s  与大多数对端的首次打洞即可成功。%s\n", green, reset)
+	case r.Score >= 60:
+		fmt.Printf("    %s~ 你的网络支持大部分 P2P 场景。%s\n", yellow, reset)
+		fmt.Printf("    %s  与 Cone NAT 对端可直连，对称型对端可能需要中继。%s\n", yellow, reset)
+	case r.Score >= 35:
+		fmt.Printf("    %s! P2P 打洞有一定挑战。%s\n", yellow, reset)
+		fmt.Printf("    %s  STUN Max 使用 Birthday 攻击 + 端口预测最大化成功率。%s\n", yellow, reset)
+		fmt.Printf("    %s  与 NAT3 对端打洞成功率约 98%%（256 sockets Birthday 攻击）。%s\n", gray, reset)
+	case r.Score > 0:
+		fmt.Printf("    %s✗ P2P 打洞较为困难。%s\n", red, reset)
+		fmt.Printf("    %s  大多数连接将使用服务器中继 (加密, 但延迟更高)。%s\n", red, reset)
+		fmt.Printf("\n    %s改善建议:%s\n", bold, reset)
+		fmt.Printf("    %s  • 尝试更换网络 (手机热点, 不同 WiFi)%s\n", gray, reset)
+		fmt.Printf("    %s  • 检查路由器是否支持 UPnP 或 NAT-PMP%s\n", gray, reset)
+		fmt.Printf("    %s  • 在路由器上设置端口转发%s\n", gray, reset)
 	default:
-		fmt.Printf("    %s✗ UDP is blocked — P2P connections are not possible.%s\n", red, reset)
-		fmt.Printf("    %s  All data will flow through the server relay (TCP WebSocket).%s\n", red, reset)
-		fmt.Printf("\n    %sSuggestions:%s\n", bold, reset)
-		fmt.Printf("    %s  • Check firewall/security software blocking UDP%s\n", gray, reset)
-		fmt.Printf("    %s  • Corporate networks often block UDP — try a different network%s\n", gray, reset)
-		fmt.Printf("    %s  • STUN Max relay mode still provides full functionality%s\n", gray, reset)
+		fmt.Printf("    %s✗ UDP 被阻断 — 无法进行 P2P 连接。%s\n", red, reset)
+		fmt.Printf("    %s  所有数据将通过服务器中继 (TCP WebSocket)。%s\n", red, reset)
+		fmt.Printf("    %s  • 检查防火墙/安全软件是否阻断 UDP%s\n", gray, reset)
+		fmt.Printf("    %s  • 企业网络通常阻断 UDP — 请尝试其他网络%s\n", gray, reset)
 	}
-
 	fmt.Println()
-
-	// NAT type explanation
-	fmt.Printf("  %s%s  NAT Type Explanation%s\n", bold, white, reset)
-	fmt.Printf("  %s──────────────────────────────────────────────%s\n", gray, reset)
-	printNATExplanation(report.NATType)
 }
 
-func printNATExplanation(natType string) {
-	type natInfo struct {
-		name  string
-		color string
-		icon  string
-		desc  string
-		p2p   string
+func printNATTable(current string) {
+	type natRow struct {
+		short, name, mapping, filtering, p2p string
+	}
+	table := []natRow{
+		{"NAT0", "开放网络", "无 NAT", "无过滤", "所有对端可直连"},
+		{"NAT1", "完全锥形", "端点无关", "端点无关", "所有对端可直连"},
+		{"NAT2", "受限锥形", "端点无关", "地址相关", "多数对端可直连"},
+		{"NAT3", "端口受限", "端点无关", "地址+端口相关", "Cone对端可直连, NAT4需Birthday"},
+		{"NAT4", "对称型", "地址+端口相关", "地址+端口相关", "仅Cone对端可直连, NAT4需中继"},
 	}
 
-	allTypes := []natInfo{
-		{NATOpen, green, "◆", "No NAT — device has a public IP address", "All peers can connect directly"},
-		{NATFullCone, green, "◆", "One-to-one NAT, any external host can send to mapped port", "All peers can connect directly"},
-		{NATRestrictedCone, green, "◇", "Like Full Cone, but only allows IPs you've contacted", "Most peers OK, some Symmetric may fail"},
-		{NATPortRestricted, yellow, "◇", "Like Restricted, but also filters by source port", "Works with Cone NATs, fails with Symmetric"},
-		{NATSymmetric, red, "▪", "Different external mapping per destination — hardest NAT", "Only works with Cone NATs (via prediction)"},
-		{NATSymmetricFirewall, red, "▪", "Public IP but firewall varies the port per destination", "Difficult — similar to Symmetric NAT"},
-		{NATBlocked, red, "✗", "UDP traffic is entirely blocked", "No P2P possible, relay only"},
-	}
-
-	for _, t := range allTypes {
+	fmt.Printf("    %-6s %-12s %-14s %-18s %s\n", "类型", "名称", "映射行为", "过滤行为", "P2P 能力")
+	fmt.Printf("    %s──────────────────────────────────────────────────────────────────────────%s\n", gray, reset)
+	for _, t := range table {
 		marker := " "
-		if t.name == natType {
-			marker = fmt.Sprintf("%s►%s", bold+t.color, reset)
-		} else {
-			marker = " "
+		style := gray
+		if t.short == current {
+			marker = green + "►" + reset
+			style = bold
 		}
-
-		nameStyle := gray
-		if t.name == natType {
-			nameStyle = bold + t.color
-		}
-
-		fmt.Printf("   %s %s%s %s%s\n", marker, nameStyle, t.icon, t.name, reset)
-		if t.name == natType {
-			fmt.Printf("       %s%s%s\n", t.color, t.desc, reset)
-			fmt.Printf("       %sP2P: %s%s\n", dim, t.p2p, reset)
-		}
+		fmt.Printf("   %s %s%-6s %-12s %-14s %-18s %s%s\n",
+			marker, style, t.short, t.name, t.mapping, t.filtering, t.p2p, reset)
 	}
-	fmt.Println()
 }
 
 // ════════════════════════════════════════════════════════════════
-// Helpers
+// 工具函数
 // ════════════════════════════════════════════════════════════════
 
-func getLocalIP() string {
+func getLocalIP(physIP net.IP) string {
+	if physIP != nil {
+		return physIP.String()
+	}
 	conn, err := net.Dial("udp4", "8.8.8.8:80")
 	if err != nil {
-		return "unknown"
+		return "未知"
 	}
 	defer conn.Close()
 	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }
 
-func abs(x int) int {
-	if x < 0 {
-		return -x
-	}
-	return x
-}
-
-// Parallel STUN queries
-func querySTUNParallel(servers []string) []STUNResult {
-	var wg sync.WaitGroup
-	results := make([]STUNResult, len(servers))
-	for i, server := range servers {
-		wg.Add(1)
-		go func(idx int, srv string) {
-			defer wg.Done()
-			results[idx] = querySTUNFresh(srv)
-		}(i, server)
-	}
-	wg.Wait()
-	return results
-}
-
-// Ensure clean exit
 func init() {
-	// Reset terminal colors on exit
-	go func() {
-		c := make(chan os.Signal, 1)
-		// We don't import signal package to keep it simple,
-		// but colors auto-reset via ANSI reset codes in output
-		_ = c
-	}()
+	_ = os.Stdout // ensure clean exit
 }

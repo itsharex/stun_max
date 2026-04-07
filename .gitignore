@@ -34,3 +34,6 @@ images/
 architecture.mmd
 architecture.png
 *.idsig
+punchtest
+*.db
+*.xdb

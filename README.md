@@ -20,22 +20,25 @@
 
 ## Features
 
-- **P2P Direct Connection** — STUN hole punch with Birthday Attack + port prediction, data never touches the server
-- **Auto Relay Fallback** — If P2P fails after 5 attempts, seamlessly falls back to server relay
+- **P2P Direct Connection** — STUN hole punch with Birthday Attack (256 sockets) + port prediction (±1000), data never touches the server
+- **Auto Relay Fallback** — If P2P fails, seamlessly falls back to server relay; background retry upgrades back to P2P
+- **NAT Traversal** — Detects NAT1 (Cone) / NAT4 (Symmetric), adapts punch strategy; ~98% success for NAT3+NAT4 pairs
 - **gVisor TCP/IP Stack** — Production-grade userspace TCP (same as Tailscale/tun2socks) for VPN proxy and port forwarding
-- **TUN VPN** — Full subnet routing with SNAT, TCP MSS clamping, smart compression bypass
+- **TUN VPN** — Full subnet routing with SNAT, multi-VPN support (multiple peers simultaneously), VPN auto-restore on reconnect
 - **Port Forwarding** — Map any remote peer's `host:port` to your localhost, with gVisor reliable transport
-- **Speed Test** — P2P bandwidth test between peers with real-time progress
-- **File Transfer** — Send files between peers with compression and progress tracking
+- **Speed Test** — P2P bandwidth test with cancel support and real-time progress
+- **File Transfer** — Send files with compression, CRC verification, rate-limited P2P UDP, auto relay fallback
+- **Proxy Bypass** — Auto-detects physical NIC, bypasses TUN proxies (Clash/V2Ray), skips CGNAT ranges
 - **LAN Auto-Detection** — Same public IP peers connect via local address (zero latency)
-- **Auto Reconnect** — Network changes trigger automatic reconnect (3s interval, infinite retry)
-- **Room-Based Access** — Password-protected rooms, created via admin dashboard only
+- **Auto Reconnect** — Network changes trigger reconnect with backoff (1s→5s), P2P + VPN auto-restore
+- **Room Management** — Client-created rooms auto-delete when owner leaves; dashboard rooms persist; per-room relay control
 - **GUI + CLI** — Gio UI desktop app (Windows/Mac/Android) + readline CLI with tab completion
-- **Android App** — Full-featured Android client with VPN support, auto permission request, and native app icon
-- **NAT Diagnostic** — Built-in `natcheck` tool detects NAT type and punch success probability
-- **Config Persistence** — Connection, forwards, STUN servers saved and restored across restarts
-- **Traffic Stats** — Real-time upload/download speed and total bytes per forward
-- **Self-Hosted STUN** — Lightweight STUN server included for restricted networks
+- **Android App** — Full-featured with VPN, auto permission, native icon, WiFi-priority networking
+- **Server Dashboard** — Room management, peer monitoring, IP geolocation, STUN stats, Kick/Ban, relay control
+- **NAT Diagnostic** — `natcheck` tool with RFC 5780 support, Chinese UI, proxy bypass, comprehensive report
+- **E2E Encryption** — X25519 + XChaCha20-Poly1305, thread-safe, 24-byte nonce
+- **SQLite Persistence** — Rooms and blacklists survive server restart
+- **Self-Hosted STUN** — Lightweight STUN server with HTTP stats API
 
 <!-- PLACEHOLDER_README_PART2 -->
 
@@ -121,7 +124,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/stun_max-server --addr :8080 --web-dir /opt/stun_max/web
+ExecStart=/usr/local/bin/stun_max-server --addr :8080 --web-dir /opt/stun_max/web --db /opt/stun_max/stun_max.db --ipdb /opt/stun_max/ip2region.xdb --stun-http http://127.0.0.1:3479
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
@@ -138,7 +141,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/stun_max-stunserver --addr :3478
+ExecStart=/usr/local/bin/stun_max-stunserver --addr :3478 --http :3479
 Restart=always
 
 [Install]
@@ -271,7 +274,7 @@ All tabs support vertical scrolling on both desktop and mobile.
 
 | Feature | Detail |
 |---------|--------|
-| E2E encryption | X25519 + AES-256-GCM for all P2P and relay data |
+| E2E encryption | X25519 + XChaCha20-Poly1305 for all P2P and relay data |
 | Room isolation | Relay verifies sender and receiver in same room |
 | Room auth | Dashboard-only creation, SHA-256 password hash |
 | Rate limiting | Login 5/min, WebSocket 20/min, Join 10/min per IP |
@@ -285,8 +288,11 @@ All tabs support vertical scrolling on both desktop and mobile.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--addr` | `:8080` | Listen address |
-| `--web-password` | (random) | Dashboard password |
+| `--web-password` | (built-in) | Dashboard password |
 | `--web-dir` | `../web` | Static files path |
+| `--db` | `stun_max.db` | SQLite database file |
+| `--ipdb` | `ip2region.xdb` | IP geolocation database |
+| `--stun-http` | `http://127.0.0.1:3479` | STUN server stats URL |
 | `--max-connections` | `5000` | Max WebSocket connections |
 | `--tls-cert` | | TLS certificate file |
 | `--tls-key` | | TLS key file |
@@ -307,9 +313,13 @@ All tabs support vertical scrolling on both desktop and mobile.
 
 ```
 server/                  Signal + relay + dashboard
-  main.go                HTTP/WS, auth, rate limiting, TLS
-  hub.go                 Rooms, peers, blacklist
-  client.go              Message routing, join validation
+  main.go                HTTP/WS, auth, rate limiting, TLS, graceful shutdown
+  hub.go                 Rooms, peers, blacklist, room ownership
+  client.go              Message routing, join validation, same-name kick
+  relay.go               Data relay with per-room toggle
+  store.go               SQLite persistence (rooms, blacklists)
+  ipinfo.go              Offline IP geolocation (ip2region)
+  stats.go               Server statistics
 
 client/core/             Networking (shared by GUI + CLI)
   client.go              Connection, reconnect, signaling
@@ -321,7 +331,8 @@ client/core/             Networking (shared by GUI + CLI)
   tun_config_*.go        Platform-specific TUN setup (darwin/linux/windows)
   stun.go                STUN discovery, hole punch, UDP read loop
   speedtest.go           P2P bandwidth testing
-  crypto.go              X25519 + AES-256-GCM key exchange
+  crypto.go              X25519 + XChaCha20-Poly1305 encryption
+  proxy_bypass.go        TUN proxy bypass (physical NIC detection)
   compress.go            Deflate compression with smart bypass
   udp_reliable.go        RUTP reliable UDP (legacy, used by old tunnels)
   types.go               Protocol types
@@ -357,8 +368,9 @@ android/                 Android build pipeline
   app/src/main/java/     VpnPermissionActivity, StunMaxVpnService, GoBridge
 
 web/                     Admin dashboard (HTML/JS/CSS)
-tools/natcheck/          NAT type diagnostic
-tools/stunserver/        Self-hosted STUN server
+tools/natcheck/          NAT type diagnostic (RFC 5780, Chinese, proxy bypass)
+tools/stunserver/        Self-hosted STUN server with HTTP stats
+tools/punchtest/         Standalone NAT3/NAT4 hole punch test tool
 ```
 
 ## License

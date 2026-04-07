@@ -23,7 +23,9 @@ type SpeedTestPanel struct {
 	SizeBtns   [6]widget.Clickable
 	SizeMB     int
 	RunBtn     widget.Clickable
+	CancelBtn  widget.Clickable
 	Running    bool
+	TestID     string // current test ID for cancellation
 	Progress   float64
 	Phase      string
 	Transport  string // actual transport being used
@@ -75,6 +77,16 @@ func (s *SpeedTestPanel) Layout(gtx layout.Context, th *material.Theme, a *App) 
 		}
 	}
 
+	// Handle cancel button
+	if s.CancelBtn.Clicked(gtx) && s.Running && a.Client != nil {
+		s.mu.Lock()
+		testID := s.TestID
+		s.mu.Unlock()
+		if testID != "" {
+			a.Client.CancelSpeedTest(testID)
+		}
+	}
+
 	// Handle run button
 	if s.RunBtn.Clicked(gtx) && !s.Running && a.Client != nil {
 		peer := s.PeerSel.Text()
@@ -89,13 +101,17 @@ func (s *SpeedTestPanel) Layout(gtx layout.Context, th *material.Theme, a *App) 
 			s.Transport = ""
 			sizeMB := s.SizeMB
 			go func() {
-				_, err := a.Client.StartSpeedTest(peer, sizeMB, "p2p")
+				testID, err := a.Client.StartSpeedTest(peer, sizeMB, "p2p")
 				if err != nil {
 					s.mu.Lock()
 					s.Error = err.Error()
 					s.Running = false
 					s.mu.Unlock()
 					a.Window.Invalidate()
+				} else {
+					s.mu.Lock()
+					s.TestID = testID
+					s.mu.Unlock()
 				}
 			}()
 		}
@@ -140,19 +156,23 @@ func (s *SpeedTestPanel) Layout(gtx layout.Context, th *material.Theme, a *App) 
 									return s.layoutSizeSelector(gtx, th)
 								})
 							}),
-							// Row 3: Run button (full width)
+							// Row 3: Run / Cancel button (full width)
 							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 								return layout.Inset{Top: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+									if running {
+										btn := material.Button(th, &s.CancelBtn, "Cancel")
+										btn.Background = ErrorColor
+										btn.Color = color.NRGBA{A: 255}
+										btn.CornerRadius = unit.Dp(4)
+										btn.Inset = layout.Inset{Top: unit.Dp(8), Bottom: unit.Dp(8), Left: unit.Dp(16), Right: unit.Dp(16)}
+										return btn.Layout(gtx)
+									}
 									label := fmt.Sprintf("P2P %dMB", s.SizeMB)
 									btn := material.Button(th, &s.RunBtn, label)
 									btn.Background = SuccessColor
 									btn.Color = color.NRGBA{A: 255}
 									btn.CornerRadius = unit.Dp(4)
 									btn.Inset = layout.Inset{Top: unit.Dp(8), Bottom: unit.Dp(8), Left: unit.Dp(16), Right: unit.Dp(16)}
-									if running {
-										btn.Background = DimColor
-										btn.Text = "Running..."
-									}
 									return btn.Layout(gtx)
 								})
 							}),

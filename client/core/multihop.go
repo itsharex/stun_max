@@ -177,10 +177,10 @@ func (c *Client) handleHopForwardAccept(msg Message) {
 // TunnelConn with the pre-assigned inbound tunnel ID, then starts the relay read loop.
 // No open_tunnel is sent — B already has the bridge to C established.
 func (c *Client) hopAcceptLoop(bridge *HopBridge, viaPeerID string) {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", bridge.LocalPort))
+	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", bridge.LocalPort))
 	if err != nil {
 		c.emit(EventLog, LogEvent{Level: "error", Message: fmt.Sprintf(
-			"Hop forward: cannot listen on :%d: %v", bridge.LocalPort, err,
+			"Hop forward: cannot listen on 127.0.0.1:%d: %v", bridge.LocalPort, err,
 		)})
 		return
 	}

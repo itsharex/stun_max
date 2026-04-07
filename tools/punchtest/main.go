@@ -124,7 +124,7 @@ type PunchResult struct {
 func main() {
 	server := flag.String("server", "ws://localhost:8080/ws", "WebSocket server URL")
 	room := flag.String("room", "room1", "Room name")
-	password := flag.String("password", "asdasd110", "Room password")
+	password := flag.String("password", "", "Room password")
 	name := flag.String("name", "punchtest", "Client display name")
 	punchCount := flag.Int("packets", 20, "Packets per burst phase")
 	birthdaySock := flag.Int("birthday", 8, "Parallel sockets for birthday attack")

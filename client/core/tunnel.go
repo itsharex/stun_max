@@ -45,10 +45,15 @@ func (c *Client) StartForward(peerID, host string, remotePort, localPort int) er
 	}
 	c.forwardsMu.RUnlock()
 
-	// Check if port is available on the system before binding
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", localPort))
+	// Bind to localhost (127.0.0.1) for security and Android compatibility.
+	// Android SELinux may block binding to 0.0.0.0.
+	bindAddr := fmt.Sprintf("127.0.0.1:%d", localPort)
+	if !c.localOnly {
+		bindAddr = fmt.Sprintf(":%d", localPort) // allow LAN access if localOnly is off
+	}
+	listener, err := net.Listen("tcp", bindAddr)
 	if err != nil {
-		return fmt.Errorf("port %d unavailable (already in use by another program)", localPort)
+		return fmt.Errorf("port %d unavailable: %v", localPort, err)
 	}
 
 	peerName := shortID(fullID)

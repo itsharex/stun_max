@@ -64,6 +64,32 @@ func (rm *RelayManager) removeSession(sessionID string) {
 	}
 }
 
+// isDataRelay checks if the relay envelope contains bulk data transfer
+// (which should be blocked when relay is disabled) vs signaling messages
+// (which must always be forwarded for P2P to work).
+//
+// Strategy: parse the inner envelope type. When E2E encryption is active,
+// the inner type is always "encrypted" — in that case, use message size
+// as heuristic: signaling messages are small (<8KB), data transfers are large.
+func isDataRelay(data json.RawMessage) bool {
+	var envelope struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return false
+	}
+
+	switch envelope.Type {
+	case "tunnel_data", "speed_test_data", "file_data":
+		return true
+	case "encrypted":
+		// E2E encrypted envelope — all message types look the same.
+		// Use size heuristic: signaling < 8KB, data transfers > 8KB.
+		return len(data) > 8192
+	}
+	return false
+}
+
 func (rm *RelayManager) relayData(from string, to string, data json.RawMessage, hub *Hub) {
 	sender := hub.findClient(from)
 	target := hub.findClient(to)
@@ -75,6 +101,19 @@ func (rm *RelayManager) relayData(from string, to string, data json.RawMessage, 
 	if sender.roomKey == "" || sender.roomKey != target.roomKey {
 		log.Printf("Relay blocked: %s and %s not in same room", from, to)
 		return
+	}
+
+	// Check relay toggle — only block DATA relay, not signaling
+	relayOff := atomic.LoadInt32(&globalRelayOff) == 1
+	if !relayOff {
+		hub.mu.RLock()
+		if room, ok := hub.rooms[target.roomKey]; ok && room.RelayDisabled {
+			relayOff = true
+		}
+		hub.mu.RUnlock()
+	}
+	if relayOff && isDataRelay(data) {
+		return // drop bulk data, but signaling passes through
 	}
 
 	dataLen := int64(len(data))

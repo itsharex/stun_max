@@ -343,8 +343,9 @@ type ForwardInfo struct {
 
 // StunInfo is a read-only snapshot of STUN state for the GUI.
 type StunInfo struct {
-	PublicAddr string
-	Enabled    bool
-	NATType    string            // our detected NAT type
-	PeerConns  map[string]string // peerID -> mode
+	PublicAddr    string
+	Enabled       bool
+	NATType       string            // our detected NAT type
+	RelayDisabled bool              // server disabled relay for this room
+	PeerConns     map[string]string // peerID -> mode
 }

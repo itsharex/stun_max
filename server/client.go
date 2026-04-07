@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -10,7 +11,7 @@ import (
 
 const (
 	writeWait      = 30 * time.Second
-	pongWait       = 120 * time.Second
+	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
 	maxMessageSize = 512 * 1024 // 512KB for tunnel data
 )
@@ -28,6 +29,7 @@ type Client struct {
 	services []string          // advertised host:port list
 	endpoint string            // STUN-discovered public UDP endpoint
 	natType  string            // NAT type: NAT1, NAT2, NAT3, NAT4
+	ipInfo   *IPInfo           // cached IP geolocation + ASN
 	features map[string]string // active features reported by client
 }
 
@@ -136,7 +138,16 @@ func (c *Client) handleMessage(msg Message) {
 			}
 			json.Unmarshal(msg.Payload, &info)
 			if info.Addr != "" {
+				oldEndpoint := c.endpoint
 				c.endpoint = info.Addr
+				// Async IP geolocation lookup (only on endpoint change)
+				if info.Addr != oldEndpoint {
+					go func(ep string) {
+						if ipInfo := lookupEndpoint(ep); ipInfo != nil {
+							c.ipInfo = ipInfo
+						}
+					}(info.Addr)
+				}
 			}
 			if info.NATType != "" {
 				c.natType = info.NATType
@@ -205,12 +216,16 @@ func (c *Client) handleJoin(msg Message) {
 		c.handleLeave()
 	}
 
-	// Rooms must be created via dashboard — no auto-create
+	// Find existing room or auto-create if not found
 	room, reason := c.hub.findRoomByName(roomName, passwordHash)
 	if room == nil {
-		c.sendError(reason + ". Repeated failed attempts may result in IP ban.")
-		log.Printf("Client %s join rejected: %s (room: %s)", c.id, reason, roomName)
-		return
+		if reason == "incorrect room password" {
+			c.sendError(reason)
+			log.Printf("Client %s join rejected: %s (room: %s)", c.id, reason, roomName)
+			return
+		}
+		// Room doesn't exist — auto-create with this client as owner
+		room = c.hub.getOrCreateRoom(roomName, passwordHash, c.id, c.name)
 	}
 
 	if room.IsBanned(c.id) {
@@ -223,12 +238,43 @@ func (c *Client) handleJoin(msg Message) {
 	c.roomKey = room.Key
 	c.status = "connecting"
 
-	room.mu.Lock()
-	room.Clients[c.id] = c
-	room.mu.Unlock()
+	// Kick stale connections with same name but different ID (e.g. Android
+	// reconnecting from a different network interface after process kill).
+	if c.name != "" {
+		room.mu.Lock()
+		for id, old := range room.Clients {
+			if id != c.id && old.name == c.name {
+				log.Printf("Kicking stale connection %s (same name '%s' as new client %s)", id, c.name, c.id)
+				delete(room.Clients, id)
+				go func(o *Client) {
+					close(o.send)
+					o.conn.Close()
+				}(old)
+			}
+		}
+		room.Clients[c.id] = c
+		room.mu.Unlock()
+	} else {
+		room.mu.Lock()
+		room.Clients[c.id] = c
+		room.mu.Unlock()
+	}
 
 	log.Printf("Client %s (%s) joined room %s", c.id, c.name, roomName)
 	room.broadcastPeerList()
+
+	// Notify client of room config (relay status)
+	if room.RelayDisabled || atomic.LoadInt32(&globalRelayOff) == 1 {
+		cfgPayload, _ := json.Marshal(map[string]interface{}{
+			"relay_disabled": true,
+		})
+		cfgMsg := Message{Type: "room_config", Payload: json.RawMessage(cfgPayload)}
+		cfgData, _ := json.Marshal(cfgMsg)
+		select {
+		case c.send <- cfgData:
+		default:
+		}
+	}
 }
 
 func (c *Client) sendError(msg string) {
