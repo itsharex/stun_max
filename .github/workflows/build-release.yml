@@ -9,7 +9,45 @@ permissions:
   contents: write
 
 jobs:
+  # Create release first with commit log as body
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate release notes from commits
+        id: notes
+        run: |
+          PREV_TAG=$(git tag --sort=-creatordate | head -2 | tail -1)
+          if [ -z "$PREV_TAG" ] || [ "$PREV_TAG" = "${GITHUB_REF#refs/tags/}" ]; then
+            NOTES=$(git log --oneline -20 --pretty=format:"- %s")
+          else
+            NOTES=$(git log --oneline "${PREV_TAG}..HEAD" --pretty=format:"- %s")
+          fi
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "STUN Max ${GITHUB_REF#refs/tags/}"
+          body: |
+            ## Changes
+            ${{ steps.notes.outputs.notes }}
+
+            ## Install
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/uk0/stun_max/main/install.sh | sudo bash
+            ```
+          draft: false
+          prerelease: false
+
   build-server:
+    needs: create-release
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -62,27 +100,21 @@ jobs:
         run: |
           go get github.com/lionsoul2014/ip2region/binding/golang@latest
           XDB=$(find $(go env GOMODCACHE) -name "ip2region_v4.xdb" 2>/dev/null | head -1)
-          if [ -n "$XDB" ]; then
-            cp "$XDB" build/ip2region.xdb
-            echo "ip2region.xdb copied ($(du -h build/ip2region.xdb | cut -f1))"
-          fi
+          [ -n "$XDB" ] && cp "$XDB" build/ip2region.xdb
 
       - name: Package server deploy zip
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           SUFFIX="${{ matrix.goos }}-${{ matrix.goarch }}"
-          mkdir -p build/stun-max-server-${SUFFIX}
-          cp build/stun_max-server-${SUFFIX} build/stun-max-server-${SUFFIX}/stun_max-server
-          cp build/stun_max-stunserver-${SUFFIX} build/stun-max-server-${SUFFIX}/stun_max-stunserver
-          cp -r web build/stun-max-server-${SUFFIX}/web
-          cp install.sh build/stun-max-server-${SUFFIX}/
-          [ -f build/ip2region.xdb ] && cp build/ip2region.xdb build/stun-max-server-${SUFFIX}/
-          chmod +x build/stun-max-server-${SUFFIX}/stun_max-server
-          chmod +x build/stun-max-server-${SUFFIX}/stun_max-stunserver
-          chmod +x build/stun-max-server-${SUFFIX}/install.sh
-          cd build && zip -r "stun-max-server-${VERSION}-${SUFFIX}.zip" "stun-max-server-${SUFFIX}/"
-          echo "Server package:"
-          ls -lh "stun-max-server-${VERSION}-${SUFFIX}.zip"
+          PKG="stun-max-server-${SUFFIX}"
+          mkdir -p "build/${PKG}"
+          cp build/stun_max-server-${SUFFIX} "build/${PKG}/stun_max-server"
+          cp build/stun_max-stunserver-${SUFFIX} "build/${PKG}/stun_max-stunserver"
+          cp -r web "build/${PKG}/web"
+          cp install.sh "build/${PKG}/"
+          [ -f build/ip2region.xdb ] && cp build/ip2region.xdb "build/${PKG}/"
+          chmod +x "build/${PKG}/stun_max-server" "build/${PKG}/stun_max-stunserver" "build/${PKG}/install.sh"
+          cd build && zip -r "${PKG}-${VERSION}.zip" "${PKG}/"
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
@@ -93,12 +125,11 @@ jobs:
             build/stun_max-cli-${{ matrix.goos }}-${{ matrix.goarch }}
             build/natcheck-${{ matrix.goos }}-${{ matrix.goarch }}
             build/punchtest-${{ matrix.goos }}-${{ matrix.goarch }}
-            build/stun-max-server-*.zip
+            build/stun-max-server-*-${{ steps.version.outputs.version }}.zip
             build/ip2region.xdb
-          draft: false
-          prerelease: false
 
   build-windows:
+    needs: create-release
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -115,37 +146,18 @@ jobs:
       - name: Build Windows binaries
         run: |
           mkdir -p build
-
-          echo "Building Windows GUI client..."
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build \
-            -ldflags="-s -w -H windowsgui" -o "build/stun_max-client-windows-amd64.exe" ./client/
-
-          echo "Building Windows CLI client..."
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags cli \
-            -ldflags="-s -w" -o "build/stun_max-cli-windows-amd64.exe" ./client/
-
-          echo "Building Windows natcheck..."
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build \
-            -ldflags="-s -w" -o "build/natcheck-windows-amd64.exe" ./tools/natcheck/
-
-          echo "Building Windows punchtest..."
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build \
-            -ldflags="-s -w" -o "build/punchtest-windows-amd64.exe" ./tools/punchtest/
-
-          ls -lh build/
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w -H windowsgui" -o "build/stun_max-client-windows-amd64.exe" ./client/
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags cli -ldflags="-s -w" -o "build/stun_max-cli-windows-amd64.exe" ./client/
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o "build/natcheck-windows-amd64.exe" ./tools/natcheck/
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o "build/punchtest-windows-amd64.exe" ./tools/punchtest/
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            build/stun_max-client-windows-amd64.exe
-            build/stun_max-cli-windows-amd64.exe
-            build/natcheck-windows-amd64.exe
-            build/punchtest-windows-amd64.exe
-          draft: false
-          prerelease: false
+          files: build/*
 
   build-macos:
+    needs: create-release
     runs-on: macos-latest
     timeout-minutes: 20
 
@@ -162,37 +174,18 @@ jobs:
       - name: Build macOS binaries
         run: |
           mkdir -p build
-
-          echo "Building macOS GUI client (arm64)..."
-          GOOS=darwin GOARCH=arm64 go build \
-            -ldflags="-s -w" -o "build/stun_max-client-darwin-arm64" ./client/
-
-          echo "Building macOS CLI client (arm64)..."
-          GOOS=darwin GOARCH=arm64 go build -tags cli \
-            -ldflags="-s -w" -o "build/stun_max-cli-darwin-arm64" ./client/
-
-          echo "Building macOS natcheck (arm64)..."
-          GOOS=darwin GOARCH=arm64 go build \
-            -ldflags="-s -w" -o "build/natcheck-darwin-arm64" ./tools/natcheck/
-
-          echo "Building macOS punchtest (arm64)..."
-          GOOS=darwin GOARCH=arm64 go build \
-            -ldflags="-s -w" -o "build/punchtest-darwin-arm64" ./tools/punchtest/
-
-          ls -lh build/
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o "build/stun_max-client-darwin-arm64" ./client/
+          GOOS=darwin GOARCH=arm64 go build -tags cli -ldflags="-s -w" -o "build/stun_max-cli-darwin-arm64" ./client/
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o "build/natcheck-darwin-arm64" ./tools/natcheck/
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o "build/punchtest-darwin-arm64" ./tools/punchtest/
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            build/stun_max-client-darwin-arm64
-            build/stun_max-cli-darwin-arm64
-            build/natcheck-darwin-arm64
-            build/punchtest-darwin-arm64
-          draft: false
-          prerelease: false
+          files: build/*
 
   build-android:
+    needs: create-release
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -222,7 +215,18 @@ jobs:
           ANDROID_HOME: /usr/local/lib/android/sdk
           ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/26.1.10909125
         run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
+          TAG="${GITHUB_REF#refs/tags/}"
+          # gogio requires semver: major.minor.patch.versioncode (no 'v' prefix)
+          SEMVER="${TAG#v}"
+          # Ensure 4-part version: x.y.z.code
+          IFS='.' read -r -a PARTS <<< "$SEMVER"
+          MAJOR="${PARTS[0]:-2}"
+          MINOR="${PARTS[1]:-0}"
+          PATCH="${PARTS[2]:-0}"
+          CODE="${PARTS[3]:-1}"
+          VERSION="${MAJOR}.${MINOR}.${PATCH}.${CODE}"
+
+          echo "Tag: ${TAG}, gogio version: ${VERSION}"
           mkdir -p build
 
           gogio \
@@ -230,12 +234,10 @@ jobs:
             -appid com.stunmax.app \
             -version "${VERSION}" \
             -minsdk 24 \
-            -o "build/stun_max-android-${VERSION}.apk" \
+            -o "build/stun_max-android-${TAG}.apk" \
             ./client/
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           files: build/stun_max-android-*.apk
-          draft: false
-          prerelease: false
