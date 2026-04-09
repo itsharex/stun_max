@@ -101,7 +101,25 @@
 
 ## Quick Start
 
-### 1. Deploy Server
+### 1. Deploy Server (One-Click)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/uk0/stun_max/main/install.sh | sudo bash
+```
+
+Custom password:
+```bash
+curl -fsSL https://raw.githubusercontent.com/uk0/stun_max/main/install.sh | STUN_MAX_PASSWORD=your_password sudo bash
+```
+
+Custom ports:
+```bash
+curl -fsSL https://raw.githubusercontent.com/uk0/stun_max/main/install.sh | STUN_MAX_PORT=9090 STUN_MAX_STUN_PORT=3479 sudo bash
+```
+
+The script auto-downloads the latest release, configures systemd, and opens firewall ports.
+
+### 1b. Manual Deploy
 
 ```bash
 ./build.sh
