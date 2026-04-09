@@ -9,9 +9,16 @@ permissions:
   contents: write
 
 jobs:
-  build-binaries:
+  build-server:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
 
     steps:
       - name: Checkout
@@ -27,62 +34,114 @@ jobs:
         id: version
         run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
-      - name: Build all binaries
+      - name: Build server binaries
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          SUFFIX="${GOOS}-${GOARCH}"
           mkdir -p build
 
-          # Server (linux/amd64)
-          echo "Building server..."
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
-            -ldflags="-s -w" -o "build/stun_max-server-linux-amd64" ./server/
+          echo "Building server (${SUFFIX})..."
+          go build -ldflags="-s -w" -o "build/stun_max-server-${SUFFIX}" ./server/
 
-          # STUN Server (linux/amd64)
-          echo "Building stunserver..."
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
-            -ldflags="-s -w" -o "build/stun_max-stunserver-linux-amd64" ./tools/stunserver/
+          echo "Building stunserver (${SUFFIX})..."
+          go build -ldflags="-s -w" -o "build/stun_max-stunserver-${SUFFIX}" ./tools/stunserver/
 
-          # NAT Check (multi-platform)
-          echo "Building natcheck..."
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build \
-            -ldflags="-s -w" -o "build/natcheck-windows-amd64.exe" ./tools/natcheck/
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
-            -ldflags="-s -w" -o "build/natcheck-linux-amd64" ./tools/natcheck/
+          echo "Building CLI client (${SUFFIX})..."
+          go build -tags cli -ldflags="-s -w" -o "build/stun_max-cli-${SUFFIX}" ./client/
 
-          # CLI Client (multi-platform)
-          echo "Building CLI clients..."
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags cli \
-            -ldflags="-s -w" -o "build/stun_max-cli-windows-amd64.exe" ./client/
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags cli \
-            -ldflags="-s -w" -o "build/stun_max-cli-linux-amd64" ./client/
+          echo "Building natcheck (${SUFFIX})..."
+          go build -ldflags="-s -w" -o "build/natcheck-${SUFFIX}" ./tools/natcheck/
 
-          # GUI Client Windows (no CGO)
-          echo "Building Windows GUI client..."
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build \
-            -ldflags="-s -w -H windowsgui" -o "build/stun_max-client-windows-amd64.exe" ./client/
+          echo "Building punchtest (${SUFFIX})..."
+          go build -ldflags="-s -w" -o "build/punchtest-${SUFFIX}" ./tools/punchtest/
 
-          # Web assets
-          cp -r web build/web
+      - name: Download ip2region database
+        run: |
+          go get github.com/lionsoul2014/ip2region/binding/golang@latest
+          XDB=$(find $(go env GOMODCACHE) -name "ip2region_v4.xdb" 2>/dev/null | head -1)
+          if [ -n "$XDB" ]; then
+            cp "$XDB" build/ip2region.xdb
+            echo "ip2region.xdb copied ($(du -h build/ip2region.xdb | cut -f1))"
+          fi
 
-          echo ""
-          echo "Build artifacts:"
-          ls -lh build/ | grep -v "^total"
-
-      - name: Package web assets
-        run: cd build && tar czf web-dashboard.tar.gz web/
+      - name: Package server deploy zip
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SUFFIX="${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p build/stun-max-server-${SUFFIX}
+          cp build/stun_max-server-${SUFFIX} build/stun-max-server-${SUFFIX}/stun_max-server
+          cp build/stun_max-stunserver-${SUFFIX} build/stun-max-server-${SUFFIX}/stun_max-stunserver
+          cp -r web build/stun-max-server-${SUFFIX}/web
+          cp install.sh build/stun-max-server-${SUFFIX}/
+          [ -f build/ip2region.xdb ] && cp build/ip2region.xdb build/stun-max-server-${SUFFIX}/
+          chmod +x build/stun-max-server-${SUFFIX}/stun_max-server
+          chmod +x build/stun-max-server-${SUFFIX}/stun_max-stunserver
+          chmod +x build/stun-max-server-${SUFFIX}/install.sh
+          cd build && zip -r "stun-max-server-${VERSION}-${SUFFIX}.zip" "stun-max-server-${SUFFIX}/"
+          echo "Server package:"
+          ls -lh "stun-max-server-${VERSION}-${SUFFIX}.zip"
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            build/stun_max-server-linux-amd64
-            build/stun_max-stunserver-linux-amd64
-            build/natcheck-windows-amd64.exe
-            build/natcheck-linux-amd64
-            build/stun_max-cli-windows-amd64.exe
-            build/stun_max-cli-linux-amd64
+            build/stun_max-server-${{ matrix.goos }}-${{ matrix.goarch }}
+            build/stun_max-stunserver-${{ matrix.goos }}-${{ matrix.goarch }}
+            build/stun_max-cli-${{ matrix.goos }}-${{ matrix.goarch }}
+            build/natcheck-${{ matrix.goos }}-${{ matrix.goarch }}
+            build/punchtest-${{ matrix.goos }}-${{ matrix.goarch }}
+            build/stun-max-server-*.zip
+            build/ip2region.xdb
+          draft: false
+          prerelease: false
+
+  build-windows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Build Windows binaries
+        run: |
+          mkdir -p build
+
+          echo "Building Windows GUI client..."
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build \
+            -ldflags="-s -w -H windowsgui" -o "build/stun_max-client-windows-amd64.exe" ./client/
+
+          echo "Building Windows CLI client..."
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags cli \
+            -ldflags="-s -w" -o "build/stun_max-cli-windows-amd64.exe" ./client/
+
+          echo "Building Windows natcheck..."
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build \
+            -ldflags="-s -w" -o "build/natcheck-windows-amd64.exe" ./tools/natcheck/
+
+          echo "Building Windows punchtest..."
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build \
+            -ldflags="-s -w" -o "build/punchtest-windows-amd64.exe" ./tools/punchtest/
+
+          ls -lh build/
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
             build/stun_max-client-windows-amd64.exe
-            build/web-dashboard.tar.gz
+            build/stun_max-cli-windows-amd64.exe
+            build/natcheck-windows-amd64.exe
+            build/punchtest-windows-amd64.exe
           draft: false
           prerelease: false
 
@@ -104,20 +163,21 @@ jobs:
         run: |
           mkdir -p build
 
-          # GUI Client (macOS ARM64, needs CGO for native dialogs)
-          echo "Building macOS GUI client..."
+          echo "Building macOS GUI client (arm64)..."
           GOOS=darwin GOARCH=arm64 go build \
             -ldflags="-s -w" -o "build/stun_max-client-darwin-arm64" ./client/
 
-          # CLI Client (macOS ARM64)
-          echo "Building macOS CLI client..."
+          echo "Building macOS CLI client (arm64)..."
           GOOS=darwin GOARCH=arm64 go build -tags cli \
             -ldflags="-s -w" -o "build/stun_max-cli-darwin-arm64" ./client/
 
-          # NAT Check (macOS ARM64)
-          echo "Building macOS natcheck..."
+          echo "Building macOS natcheck (arm64)..."
           GOOS=darwin GOARCH=arm64 go build \
             -ldflags="-s -w" -o "build/natcheck-darwin-arm64" ./tools/natcheck/
+
+          echo "Building macOS punchtest (arm64)..."
+          GOOS=darwin GOARCH=arm64 go build \
+            -ldflags="-s -w" -o "build/punchtest-darwin-arm64" ./tools/punchtest/
 
           ls -lh build/
 
@@ -128,6 +188,7 @@ jobs:
             build/stun_max-client-darwin-arm64
             build/stun_max-cli-darwin-arm64
             build/natcheck-darwin-arm64
+            build/punchtest-darwin-arm64
           draft: false
           prerelease: false
 
