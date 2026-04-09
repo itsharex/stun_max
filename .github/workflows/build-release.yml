@@ -146,9 +146,23 @@ jobs:
       - name: Build Windows binaries
         run: |
           mkdir -p build
+
+          echo "Building Windows server..."
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o "build/stun_max-server-windows-amd64.exe" ./server/
+
+          echo "Building Windows stunserver..."
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o "build/stun_max-stunserver-windows-amd64.exe" ./tools/stunserver/
+
+          echo "Building Windows GUI client..."
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w -H windowsgui" -o "build/stun_max-client-windows-amd64.exe" ./client/
+
+          echo "Building Windows CLI client..."
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags cli -ldflags="-s -w" -o "build/stun_max-cli-windows-amd64.exe" ./client/
+
+          echo "Building Windows natcheck..."
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o "build/natcheck-windows-amd64.exe" ./tools/natcheck/
+
+          echo "Building Windows punchtest..."
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o "build/punchtest-windows-amd64.exe" ./tools/punchtest/
 
       - name: Upload to Release
