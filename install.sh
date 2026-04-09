@@ -63,12 +63,82 @@ for cmd in curl unzip systemctl; do
     command -v $cmd &>/dev/null || error "Required: $cmd (install with: apt install $cmd)"
 done
 
+# ─── China GitHub acceleration ────────────────────────────────
+
+GITHUB_PROXY=""
+GITHUB_RAW_PROXY=""
+
+detect_china() {
+    # Method 1: check if Chinese DNS is reachable (fastest)
+    if curl -fsSL --max-time 2 "https://myip.ipip.net" 2>/dev/null | grep -qi "中国"; then
+        return 0
+    fi
+    # Method 2: check common Chinese IP ranges via cip.cc
+    local ip_info=$(curl -fsSL --max-time 3 "http://cip.cc" 2>/dev/null)
+    if echo "$ip_info" | grep -qi "中国\|China"; then
+        return 0
+    fi
+    # Method 3: check if github.com is slow (>3s = likely China)
+    local start=$(date +%s%N)
+    curl -fsSL --max-time 5 -o /dev/null "https://github.com" 2>/dev/null
+    local end=$(date +%s%N)
+    local elapsed=$(( (end - start) / 1000000 ))
+    if [ "$elapsed" -gt 3000 ] 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# Available China GitHub proxies (tested in order, first working one wins)
+CHINA_PROXIES=(
+    "https://ghfast.top/"
+    "https://mirror.ghproxy.com/"
+    "https://gh-proxy.com/"
+    "https://ghproxy.net/"
+)
+
+if detect_china; then
+    info "Detected China network, testing GitHub proxies..."
+    for proxy in "${CHINA_PROXIES[@]}"; do
+        if curl -fsSL --max-time 5 -o /dev/null "${proxy}https://github.com/${REPO}/releases" 2>/dev/null; then
+            GITHUB_PROXY="$proxy"
+            ok "Using proxy: ${proxy}"
+            break
+        fi
+    done
+    if [ -z "$GITHUB_PROXY" ]; then
+        warn "No proxy available, using direct GitHub (may be slow)"
+    fi
+else
+    info "Direct GitHub access OK"
+fi
+
+# Helper: prepend proxy to GitHub URLs
+gh_url() {
+    echo "${GITHUB_PROXY}$1"
+}
+
+gh_raw() {
+    local url="$1"
+    if [ -n "$GITHUB_PROXY" ]; then
+        echo "${GITHUB_PROXY}${url}"
+    else
+        echo "$url"
+    fi
+}
+
 # ─── Get latest release version ───────────────────────────────
 
 if [ "$VERSION" = "latest" ]; then
     info "Fetching latest release from GitHub..."
-    VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+    # API doesn't need proxy (small JSON response)
+    VERSION=$(curl -fsSL --max-time 10 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
         | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+    if [ -z "$VERSION" ] && [ -n "$GITHUB_PROXY" ]; then
+        # Fallback: try proxy for API too
+        VERSION=$(curl -fsSL --max-time 10 "$(gh_url "https://api.github.com/repos/${REPO}/releases/latest")" 2>/dev/null \
+            | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+    fi
     [ -z "$VERSION" ] && error "No release found. Create a tag first: git tag v2.0.0 && git push origin v2.0.0"
 fi
 
@@ -85,9 +155,9 @@ sleep 1
 
 # ─── Download server zip ─────────────────────────────────────
 
-RELEASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+RELEASE_BASE="https://github.com/${REPO}/releases/download/${VERSION}"
 ZIP_NAME="stun-max-server-${VERSION}-linux-${ARCH}.zip"
-ZIP_URL="${RELEASE_URL}/${ZIP_NAME}"
+ZIP_URL="$(gh_url "${RELEASE_BASE}/${ZIP_NAME}")"
 
 info "Downloading ${ZIP_NAME}..."
 if curl -fsSL -o "${TMP_DIR}/${ZIP_NAME}" "$ZIP_URL" 2>/dev/null; then
@@ -109,19 +179,19 @@ else
     warn "Zip not found, downloading individual binaries..."
     mkdir -p "$DATA_DIR" "$WEB_DIR"
 
-    curl -fsSL -o "${INSTALL_DIR}/stun_max-server" "${RELEASE_URL}/stun_max-server-linux-${ARCH}" || \
+    curl -fsSL -o "${INSTALL_DIR}/stun_max-server" "$(gh_url "${RELEASE_BASE}/stun_max-server-linux-${ARCH}")" || \
         error "Failed to download server binary"
     chmod +x "${INSTALL_DIR}/stun_max-server"
 
-    curl -fsSL -o "${INSTALL_DIR}/stun_max-stunserver" "${RELEASE_URL}/stun_max-stunserver-linux-${ARCH}" 2>/dev/null && \
+    curl -fsSL -o "${INSTALL_DIR}/stun_max-stunserver" "$(gh_url "${RELEASE_BASE}/stun_max-stunserver-linux-${ARCH}")" 2>/dev/null && \
         chmod +x "${INSTALL_DIR}/stun_max-stunserver" || true
 
     for f in index.html dashboard.js style.css; do
-        curl -fsSL -o "${WEB_DIR}/${f}" "https://raw.githubusercontent.com/${REPO}/${VERSION}/web/${f}" 2>/dev/null || \
-        curl -fsSL -o "${WEB_DIR}/${f}" "https://raw.githubusercontent.com/${REPO}/main/web/${f}" 2>/dev/null || true
+        curl -fsSL -o "${WEB_DIR}/${f}" "$(gh_raw "https://raw.githubusercontent.com/${REPO}/${VERSION}/web/${f}")" 2>/dev/null || \
+        curl -fsSL -o "${WEB_DIR}/${f}" "$(gh_raw "https://raw.githubusercontent.com/${REPO}/main/web/${f}")" 2>/dev/null || true
     done
 
-    curl -fsSL -o "${DATA_DIR}/ip2region.xdb" "${RELEASE_URL}/ip2region.xdb" 2>/dev/null || true
+    curl -fsSL -o "${DATA_DIR}/ip2region.xdb" "$(gh_url "${RELEASE_BASE}/ip2region.xdb")" 2>/dev/null || true
 fi
 
 ok "Binaries installed"
