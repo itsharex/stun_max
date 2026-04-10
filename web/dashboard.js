@@ -217,6 +217,17 @@ class Dashboard {
         } catch {}
     }
 
+    async toggleLock(room, locked) {
+        try {
+            await this.apiFetch('/api/rooms/lock', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ room, locked }),
+            });
+            this.refresh();
+        } catch {}
+    }
+
     async toggleRelay(room, disabled) {
         try {
             await this.apiFetch('/api/relay', {
@@ -408,6 +419,7 @@ class Dashboard {
                     <span class="room-traffic">${this.formatBytes(room.bytes_relayed || 0)} relayed</span>
                     ${room.created_at ? `<span class="room-created">${this.formatCreatedAt(room.created_at)}</span>` : ''}
                     <span class="room-peer-count">${room.peers.length} peer${room.peers.length !== 1 ? 's' : ''}</span>
+                    <button class="lock-toggle ${room.locked ? 'lock-on' : 'lock-off'}" onclick="app.toggleLock('${this.esc(room.name)}', ${!room.locked})">${room.locked ? '🔒 Locked' : '🔓 Open'}</button>
                     <button class="relay-toggle ${room.relay_disabled ? 'relay-off' : 'relay-on'}" onclick="app.toggleRelay('${this.esc(room.name)}', ${!room.relay_disabled})">${room.relay_disabled ? '🚫 Relay Off' : '✓ Relay On'}</button>
                     <button class="room-delete" onclick="app.deleteRoom('${this.esc(room.name)}')">Delete</button>
                 </div>

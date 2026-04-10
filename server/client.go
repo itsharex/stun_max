@@ -234,6 +234,12 @@ func (c *Client) handleJoin(msg Message) {
 		return
 	}
 
+	if room.Locked {
+		c.sendError("room is locked, no new connections allowed")
+		log.Printf("Client %s rejected: room %s is locked", c.id, roomName)
+		return
+	}
+
 	c.room = roomName
 	c.roomKey = room.Key
 	c.status = "connecting"

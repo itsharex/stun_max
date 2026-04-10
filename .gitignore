@@ -37,3 +37,4 @@ architecture.png
 punchtest
 *.db
 *.xdb
+build-test-apk.sh

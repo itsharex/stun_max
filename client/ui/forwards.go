@@ -444,18 +444,14 @@ func (f *ForwardsPanel) layoutActiveCard(gtx layout.Context, th *material.Theme,
 							// Mode toggle button
 							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 								return layout.Inset{Left: unit.Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-									// Only show relay button when P2P is active
 									label := ""
 									bg := DimColor
-									if fwd.Mode == "P2P" && !fwd.ForceRelay {
+									if fwd.ForceRelay {
+										label = "→ Auto"
+										bg = SuccessColor
+									} else {
 										label = "→ Relay"
 										bg = WarningColor
-									} else if fwd.ForceRelay {
-										label = "→ P2P"
-										bg = SuccessColor
-									}
-									if label == "" {
-										return layout.Dimensions{} // no button if relay-only (no P2P available)
 									}
 									btn := material.Button(th, f.modeBtn(fwd.LocalPort), label)
 									btn.Background = bg

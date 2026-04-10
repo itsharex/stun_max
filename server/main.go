@@ -416,6 +416,38 @@ func apiRelayToggle(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
+func apiLockToggle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Room   string `json:"room"`
+		Locked bool   `json:"locked"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Room == "" {
+		http.Error(w, `{"error":"room required"}`, http.StatusBadRequest)
+		return
+	}
+	hub.mu.RLock()
+	for _, room := range hub.rooms {
+		if room.Name == req.Room {
+			room.mu.Lock()
+			room.Locked = req.Locked
+			room.mu.Unlock()
+			if req.Locked {
+				log.Printf("Room %s LOCKED", req.Room)
+			} else {
+				log.Printf("Room %s UNLOCKED", req.Room)
+			}
+			break
+		}
+	}
+	hub.mu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+}
+
 func apiHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -485,6 +517,7 @@ func main() {
 	mux.HandleFunc("/api/rooms", requireAuth(apiRooms))
 	mux.HandleFunc("/api/rooms/kick", requireAuth(apiKick))
 	mux.HandleFunc("/api/relay", requireAuth(apiRelayToggle))
+	mux.HandleFunc("/api/rooms/lock", requireAuth(apiLockToggle))
 	mux.HandleFunc("/api/rooms/ban", requireAuth(apiBan))
 	mux.HandleFunc("/api/rooms/unban", requireAuth(apiUnban))
 	mux.HandleFunc("/api/auth", requireAuth(apiAuthCheck))

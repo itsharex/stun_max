@@ -35,6 +35,7 @@ type RoomInfo struct {
 	Protected    bool       `json:"protected"`
 	Persistent    bool       `json:"persistent"`
 	RelayDisabled bool       `json:"relay_disabled"`
+	Locked        bool       `json:"locked"`
 	OwnerName     string     `json:"owner_name,omitempty"`
 	OwnerID       string     `json:"owner_id,omitempty"`
 	Peers        []PeerInfo `json:"peers"`
@@ -55,8 +56,9 @@ type Room struct {
 	CreatedAt    time.Time
 	OwnerID      string // client ID of the room creator (empty = dashboard-created)
 	OwnerName    string // display name of the owner
-	Persistent   bool   // true = dashboard-created, won't auto-delete
+	Persistent    bool  // true = dashboard-created, won't auto-delete
 	RelayDisabled bool  // true = relay blocked, P2P only
+	Locked        bool  // true = no new joins allowed
 }
 
 // Hub manages all rooms and clients
@@ -372,6 +374,7 @@ func (h *Hub) getRoomsInfo() []RoomInfo {
 			Protected:     room.PasswordHash != "",
 			Persistent:    room.Persistent,
 			RelayDisabled: room.RelayDisabled,
+			Locked:        room.Locked,
 			OwnerName:     room.OwnerName,
 			OwnerID:       room.OwnerID,
 			Peers:        room.getPeerList(),

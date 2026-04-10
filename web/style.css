@@ -257,6 +257,14 @@ body {
 .room-peer-count { color: #888; font-size: 13px; margin-left: auto; }
 .room-traffic { color: #00d4ff; font-size: 12px; font-family: 'JetBrains Mono', 'SF Mono', monospace; opacity: 0.8; }
 .room-created { color: #666; font-size: 11px; font-style: italic; }
+.lock-toggle {
+    padding: 4px 10px; border-radius: 6px; border: 1px solid; cursor: pointer; font-size: 11px;
+    font-weight: 600; transition: all 0.15s;
+}
+.lock-on { border-color: #ff444444; color: #ff6666; background: #ff444411; }
+.lock-on:hover { background: #ff444433; }
+.lock-off { border-color: #00c85344; color: #00c853; background: #00c85311; }
+.lock-off:hover { background: #00c85333; }
 .relay-toggle {
     padding: 4px 10px; border-radius: 6px; border: 1px solid; cursor: pointer; font-size: 11px;
     font-weight: 600; transition: all 0.15s;

@@ -160,16 +160,21 @@ func (fn *forwardNetstack) outboundLoop() {
 }
 
 func (fn *forwardNetstack) sendPacket(data []byte) {
-	fn.client.peerConnsMu.RLock()
-	pc := fn.client.peerConns[fn.peerID]
-	fn.client.peerConnsMu.RUnlock()
+	// Check if any forward to this peer is forced to relay
+	forceRelay := fn.client.isPeerForwardForceRelay(fn.peerID)
 
-	if pc != nil && pc.Mode == "direct" && pc.UDPAddr != nil {
-		msg := make([]byte, 3+len(data))
-		copy(msg[:3], []byte("FN:"))
-		copy(msg[3:], data)
-		if fn.client.udpSend(msg, pc.UDPAddr) == nil {
-			return
+	if !forceRelay {
+		fn.client.peerConnsMu.RLock()
+		pc := fn.client.peerConns[fn.peerID]
+		fn.client.peerConnsMu.RUnlock()
+
+		if pc != nil && pc.Mode == "direct" && pc.UDPAddr != nil {
+			msg := make([]byte, 3+len(data))
+			copy(msg[:3], []byte("FN:"))
+			copy(msg[3:], data)
+			if fn.client.udpSend(msg, pc.UDPAddr) == nil {
+				return
+			}
 		}
 	}
 

@@ -1,5 +1,66 @@
 # CHANGELOG
 
+## 2026-04-10 - Room Lock, Relay Control Fix, Forward Relay Toggle
+
+### Server: Room Lock
+- **Lock room** — dashboard toggle to block new joins (existing peers unaffected)
+- **API** — `POST /api/rooms/lock` with `{"room":"name","locked":true/false}`
+
+### Relay Control Fix
+- **Signaling passthrough** — relay disable now only blocks bulk data (`tunnel_data`, `speed_test_data`, `file_data`), signaling messages always pass through
+- **Encrypted message handling** — `encrypted` envelopes use size heuristic (<8KB = signaling, >8KB = data) instead of blanket block
+
+### Forward Relay Toggle
+- **ForceRelay in data path** — `sendPacket()` now checks `isPeerForwardForceRelay()` before attempting P2P UDP
+- **UI always shows toggle** — relay switch button visible regardless of current mode (`→ Relay` / `→ Auto`)
+- **Per-forward control** — each forward can independently force relay or use auto mode
+
+### WebSocket Keepalive
+- **Ping interval** — reduced from 30s to 15s for better NAT mapping persistence on Symmetric NATs
+
+## 2026-04-08 - Server Upgrade + VPN Stability + Relay Control
+
+### Server: SQLite Persistence + Dashboard Upgrade
+- **SQLite storage** — rooms, blacklists, relay bytes persisted to `stun_max.db`, survive server restart
+- **Dashboard redesign** — search bar, NAT type badges, IP geolocation (ip2region offline DB), peer duration, STUN Server tab, Kick/Ban buttons
+- **Room ownership** — client-created rooms auto-delete when owner leaves; dashboard-created rooms persist
+- **IP geolocation** — offline ip2region database (10MB), shows city/ISP for each peer endpoint
+- **Health endpoint** — `/health` returns status/uptime/connections without auth
+- **Graceful shutdown** — SIGINT/SIGTERM syncs bytes to SQLite before exit
+- **Relay control** — per-room and global relay on/off toggle via dashboard; only blocks data transfer, signaling always passes through
+- **Same-name kick** — server auto-kicks stale connections when same-named client reconnects (fixes Android dual-NIC ghost peers)
+
+### VPN Stability Fixes
+- **VPN setup dedup** — ignore duplicate `tun_setup` from same peer when session is alive, re-send ack instead
+- **Multi-VPN support** — B can accept VPN from both A and C simultaneously with unique 10.7.{N}.x subnets
+- **VPN index allocation** — `nextVPNIndex()` finds unused index instead of `len(tunDevices)` to avoid subnet conflicts
+- **VPN auto-restore** — when VPN peer disconnects and reconnects, initiator auto-restarts VPN after 5s
+- **Android VPN crash fix** — JNI `NewGlobalRef` protects context from GC during `vpnEstablish`; re-acquire env/context after `startVpnService`
+- **stopPlatformVPN guard** — only stops Android VpnService when last VPN session closes, not on each individual stop
+
+### P2P Reconnection Fixes
+- **Address-change re-punch** — when peer reconnects with new STUN endpoint, reset mode to "connecting" and re-punch even if previously "direct"
+- **NAT detection no re-broadcast** — `detectNATType` no longer sends redundant `sendStunInfo("")`, reducing peer_list flapping
+- **Crypto reset cleanup** — cancel active speed tests and close stale forward netstacks when peer address changes
+- **Reconnect proxy bypass** — reconnect WebSocket dialer uses `bypassDialer` for TUN proxy environments
+- **Reconnect backoff** — 1s → 2s → 3s → 5s (cap), instead of fixed 3s
+
+### Android Fixes
+- **Stable machine ID** — `isAndroid()` detects via `/system/bin/app_process` (not `/system/build.prop` which requires root); uses `hostname+name` instead of MAC for ID generation
+- **WiFi priority** — `getPrimaryMAC()` and `detectPhysicalIP()` prefer WiFi (wlan0) over cellular (rmnet*), skip CGNAT 198.18.x
+- **Port forward binding** — bind to `127.0.0.1` instead of `0.0.0.0` for Android SELinux compatibility
+
+### Speed Test + File Transfer
+- **Speed test cancel** — Cancel button in UI, `st_cancel` protocol message, cancel channel in send loop
+- **File transfer rate limiting** — P2P UDP send paced at 2ms/chunk to prevent buffer overflow
+- **Consecutive failure detection** — P2P send failures >10 auto-switch to relay permanently
+- **NACK buffer enlarged** — 64 → 256 to prevent retransmit request overflow
+
+### NAT Detection (Corrected)
+- **Simplified classification** — Cone NAT = NAT1 (no false NAT3), Symmetric = NAT4; only 2 categories that matter for punch strategy
+- **RFC 5780 natcheck tool** — full rewrite in Chinese, offline proxy bypass, 6 tests, comprehensive report
+- **Birthday attack upgrade** — 256 sockets for NAT4 scenarios, ±1000 port prediction range, Phase 4 random port spray (1024 probes)
+
 ## 2026-04-07 - NAT Type Detection + Proxy Bypass + Adaptive Hole Punch
 
 ### NAT Type Detection
