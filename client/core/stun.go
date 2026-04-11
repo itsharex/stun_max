@@ -306,8 +306,14 @@ func (c *Client) detectNATType(publicAddr, primarySrv string, servers []string) 
 			results[0].port, results[1].port)})
 		c.detectPortAllocation(servers)
 	}
-	// NOTE: No sendStunInfo("") here — DiscoverSTUN already broadcast once.
-	// NAT type will be included in subsequent stun_info messages (peer join, etc.)
+	// If we're Cone NAT, pre-create sockets with known mapped ports.
+	// These are shared with Symmetric peers via stun_info so they can
+	// target our exact ports instead of random scanning.
+	if c.natType != NATSymmetric {
+		c.preCreateConeSockets(primarySrv, 20)
+		// Re-broadcast stun_info with cone_ports included
+		c.sendStunInfo("")
+	}
 }
 
 // hasLocalIP checks if the given IP matches any local network interface.
@@ -466,6 +472,58 @@ func (c *Client) detectPortAllocation(servers []string) {
 	c.peerConnsMu.Unlock()
 }
 
+// preCreateConeSockets creates N UDP sockets and STUN-probes each to learn
+// their mapped ports. These known ports are shared with peers via stun_info
+// so Symmetric peers can target them precisely instead of guessing.
+// Inspired by p2p_punch.py's Cone pre-probe strategy.
+func (c *Client) preCreateConeSockets(stunServer string, count int) {
+	c.conePunchSockets = nil
+	c.conePunchPorts = nil
+
+	var sockets []*net.UDPConn
+	var ports []int
+
+	for i := 0; i < count; i++ {
+		conn, err := bypassListenUDP()
+		if err != nil {
+			continue
+		}
+
+		// STUN probe to learn this socket's mapped port
+		addr := stunQueryFresh(conn, stunServer)
+		if addr == "" {
+			conn.Close()
+			continue
+		}
+
+		_, portStr, _ := net.SplitHostPort(addr)
+		p := 0
+		fmt.Sscanf(portStr, "%d", &p)
+		if p > 0 {
+			sockets = append(sockets, conn)
+			ports = append(ports, p)
+		} else {
+			conn.Close()
+		}
+	}
+
+	if len(sockets) > 0 {
+		c.conePunchSockets = sockets
+		c.conePunchPorts = ports
+		c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf(
+			"Cone pre-probe: %d sockets with known mapped ports %v", len(ports), ports)})
+	}
+}
+
+// closeConePunchSockets cleans up pre-created cone sockets.
+func (c *Client) closeConePunchSockets() {
+	for _, conn := range c.conePunchSockets {
+		conn.Close()
+	}
+	c.conePunchSockets = nil
+	c.conePunchPorts = nil
+}
+
 func sortedMedian(vals []int) int {
 	sorted := make([]int, len(vals))
 	copy(sorted, vals)
@@ -527,12 +585,15 @@ func (c *Client) sendStunInfo(to string) {
 		localPort := udp.LocalAddr().(*net.UDPAddr).Port
 		localUDP = fmt.Sprintf("%s:%d", localAddr, localPort)
 	}
-	info := map[string]string{
+	info := map[string]interface{}{
 		"addr":  c.publicAddr,
 		"local": localUDP,
 	}
 	if c.natType != "" {
 		info["nat_type"] = c.natType
+	}
+	if len(c.conePunchPorts) > 0 {
+		info["cone_ports"] = c.conePunchPorts
 	}
 	payload, _ := json.Marshal(info)
 	c.sendMsg(Message{
@@ -557,9 +618,10 @@ func (c *Client) handleStunInfo(msg Message) {
 		return
 	}
 	var info struct {
-		Addr    string `json:"addr"`
-		Local   string `json:"local"`
-		NATType string `json:"nat_type"`
+		Addr      string `json:"addr"`
+		Local     string `json:"local"`
+		NATType   string `json:"nat_type"`
+		ConePorts []int  `json:"cone_ports"`
 	}
 	if err := json.Unmarshal(msg.Payload, &info); err != nil || info.Addr == "" {
 		return
@@ -592,9 +654,12 @@ func (c *Client) handleStunInfo(msg Message) {
 		c.peerConns[msg.From] = pc
 	}
 
-	// Store peer's NAT type
+	// Store peer's NAT type and cone ports
 	if info.NATType != "" {
 		pc.NATType = info.NATType
+	}
+	if len(info.ConePorts) > 0 {
+		pc.ConePorts = info.ConePorts
 	}
 
 	// If peer is already direct AND the address hasn't changed, skip.
@@ -676,6 +741,7 @@ func (c *Client) attemptHolePunch(peerID string, isLAN bool) {
 		}
 	}
 	peerNAT := pc.NATType
+	peerConePorts := pc.ConePorts // Cone peer's known mapped ports
 	c.peerConnsMu.Unlock()
 
 	addr := pc.UDPAddr
@@ -718,37 +784,73 @@ func (c *Client) attemptHolePunch(peerID string, isLAN bool) {
 		return // Cone+Cone: Phase 1 is enough
 	}
 
-	// Phase 2: Birthday Attack with progressive sending
-	// Progressive: first round sends to 3 targets, expanding each round.
-	// This avoids burning through the prediction window on Symmetric NATs
-	// where each outbound packet consumes a port from the NAT's pool.
-	birthdaySockets := 256
+	// Phase 2: Birthday Attack
+	// Strategy depends on whether peer shared cone_ports:
+	//   - Sym → Cone (peer has cone_ports): each socket targets one known port (minimal NAT consumption)
+	//   - Cone → Sym: use pre-created sockets with known mapped ports
+	//   - Sym → Sym: standard birthday to addr
+	iAmSym := myNAT == NATSymmetric
+	hasPeerConePorts := len(peerConePorts) > 0 && iAmSym
+
 	var extraConns []*net.UDPConn
-	for i := 0; i < birthdaySockets; i++ {
-		conn, err := bypassListenUDP()
-		if err != nil {
-			continue
+
+	if iAmCone && len(c.conePunchSockets) > 0 {
+		// Cone side: reuse pre-created sockets (already have known mapped ports)
+		extraConns = c.conePunchSockets
+		c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf(
+			"Using %d pre-probed Cone sockets for punch", len(extraConns))})
+	} else {
+		// Symmetric side or no pre-probed sockets: create fresh ones
+		birthdaySockets := 256
+		if hasPeerConePorts {
+			// Peer has cone_ports: we only need 1 socket per known port
+			birthdaySockets = len(peerConePorts) * 2
+			if birthdaySockets > 256 {
+				birthdaySockets = 256
+			}
 		}
-		extraConns = append(extraConns, conn)
+		for i := 0; i < birthdaySockets; i++ {
+			conn, err := bypassListenUDP()
+			if err != nil {
+				continue
+			}
+			extraConns = append(extraConns, conn)
+		}
 	}
 
 	if len(extraConns) > 0 {
-		// Progressive: round 0 sends to addr only, round 1+ expands targets
-		for round := 0; round < 5; round++ {
-			select {
-			case <-c.done:
-				for _, conn := range extraConns {
-					conn.Close()
+		if hasPeerConePorts {
+			// Sym → Cone: each socket sends to ONE known cone port (minimal NAT consumption)
+			c.emit(EventLog, LogEvent{Level: "info", Message: fmt.Sprintf(
+				"Targeting %d known Cone ports: %v", len(peerConePorts), peerConePorts)})
+			for round := 0; round < 50; round++ {
+				select {
+				case <-c.done:
+					break
+				default:
 				}
-				return
-			default:
+				for i, conn := range extraConns {
+					targetPort := peerConePorts[i%len(peerConePorts)]
+					conn.WriteToUDP(punch, &net.UDPAddr{IP: addr.IP, Port: targetPort})
+				}
+				time.Sleep(20 * time.Millisecond)
 			}
-			for _, conn := range extraConns {
-				conn.WriteToUDP(punch, addr)
+		} else {
+			// Standard birthday: all sockets send to known addr
+			for round := 0; round < 5; round++ {
+				select {
+				case <-c.done:
+					break
+				default:
+				}
+				for _, conn := range extraConns {
+					conn.WriteToUDP(punch, addr)
+				}
+				time.Sleep(50 * time.Millisecond)
 			}
-			time.Sleep(50 * time.Millisecond)
 		}
-		// Keep sockets open for Phase 4 if we're the Cone side
+
+		// Keep Cone sockets for Phase 4 spray
 		if !iAmCone {
 			for _, conn := range extraConns {
 				conn.Close()
@@ -834,10 +936,13 @@ func (c *Client) attemptHolePunch(peerID string, isLAN bool) {
 		}
 	}
 
-	// Cleanup remaining birthday sockets
-	for _, conn := range extraConns {
-		conn.Close()
+	// Cleanup: close birthday sockets (but NOT cone pre-probed sockets — they're reused)
+	if !iAmCone {
+		for _, conn := range extraConns {
+			conn.Close()
+		}
 	}
+	// Cone pre-probed sockets stay open for future punch attempts / keepalive
 }
 
 func (c *Client) onHolePunchSuccess(peerID string, addr *net.UDPAddr) {

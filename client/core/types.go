@@ -69,6 +69,7 @@ type PeerConn struct {
 	AutoHopVia string           // if non-empty, this peer is reached via auto-hop through this peer
 	AutoHopID  string           // hop ID for the auto-hop bridge
 	NATType    string           // peer's NAT type: NAT1, NAT2, NAT3, NAT4
+	ConePorts  []int            // Cone peer's pre-probed mapped ports (for Sym→Cone targeting)
 }
 
 // TunnelOpen is sent to request opening a tunnel to a peer's local port.

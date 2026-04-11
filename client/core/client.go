@@ -93,6 +93,10 @@ type Client struct {
 	// NAT port allocation model (for Symmetric NAT prediction)
 	portModel *portModel
 
+	// Cone punch sockets: pre-created sockets with known mapped ports
+	conePunchSockets []*net.UDPConn
+	conePunchPorts   []int // mapped ports for each socket
+
 	// Peer leave debounce: delay "peer left" to handle brief disconnects
 	pendingLeaves   map[string]*time.Timer // name → cancel timer
 	pendingLeavesMu sync.Mutex
@@ -891,6 +895,9 @@ func (c *Client) resetP2PState() {
 		pc.AutoHopID = ""
 	}
 	c.peerConnsMu.Unlock()
+
+	// Close cone punch sockets
+	c.closeConePunchSockets()
 
 	// Clear P2P connectivity maps
 	c.p2pMapsMu.Lock()
